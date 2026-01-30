@@ -24,7 +24,7 @@ export const WalletWrapper = ({ children }) => {
     return (
         <AleoWalletProvider
             wallets={wallets}
-            autoConnect={false}
+            autoConnect={true}
             network={Network.TESTNET}
             decryptPermission={DecryptPermission.UponRequest}
             programs={[PROGRAM_ID, "credits.aleo"]}

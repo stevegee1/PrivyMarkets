@@ -1,0 +1,9 @@
+{
+  "name": "privymarkets-tests",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "SDK-based tests for PrivyMarkets escrow system",
+  "dependencies": {
+    "@provablehq/sdk": "latest"
+  }
+}

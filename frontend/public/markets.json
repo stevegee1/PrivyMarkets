@@ -1,0 +1,12 @@
+[
+  {
+    "market_id": "4053716152732613659833034854109634480943927753148695600170734602800210791200field",
+    "question": "Will Bitcoin surpass $100k before end of 2025?",
+    "description": "Resolves YES if the BTC/USD spot price on Binance closes above $100,000 at any point before December 31 2025 23:59 UTC.",
+    "category": "Crypto",
+    "image": null,
+    "resolution_time": 1767225600,
+    "metadata_cid": null,
+    "source_of_truth": "https://www.binance.com/en/trade/BTC_USDT"
+  }
+]

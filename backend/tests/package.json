@@ -1,9 +1,11 @@
 {
-  "name": "privymarkets-tests",
+  "name": "privymarkets-backend-scripts",
   "version": "1.0.0",
   "type": "module",
-  "description": "SDK-based tests for PrivyMarkets escrow system",
+  "scripts": {
+  },
   "dependencies": {
-    "@provablehq/sdk": "latest"
+    "@provablehq/sdk": "latest",
+    "dotenv": "^16.4.5"
   }
 }

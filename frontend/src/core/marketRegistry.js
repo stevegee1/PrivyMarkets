@@ -109,16 +109,15 @@ export async function loadAllMarkets() {
         return null;
       }
 
-      // Ensure id format is clean (sometimes field suffix causes issues in URLs)
-      const cleanId = id.replace(/\.private$|\.public$/, "").trim();
+      // Ensure id format is clean
+      const idStr = String(id);
+      const cleanId = idStr.replace(/\.private$|\.public$/, "").trim();
 
-      const chain = await fetchMarketOnChainState(cleanId);
-      if (!chain) {
-        console.warn(
-          `market_states[${cleanId}] returned null — ` +
-          `showing market from registry with fallback state (Open).`
-        );
-      }
+      try {
+        const chain = await fetchMarketOnChainState(cleanId);
+        if (!chain) {
+          console.warn(`market_states[${cleanId}] returned null`);
+        }
 
       return {
         // React key + identifier
@@ -140,7 +139,11 @@ export async function loadAllMarkets() {
         resolved:        chain?.resolved     ?? false,
         result:          chain?.result       ?? false,
         winning_pool:    chain?.winning_pool ?? 0,
-      };
+        };
+      } catch (e) {
+        console.error(`Error loading market ${cleanId}:`, e);
+        return null;
+      }
     }),
   );
 

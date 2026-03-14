@@ -1,11 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useWallet } from '@provablehq/aleo-wallet-adaptor-react';
 import { PROGRAM_ID, USDCX_PROGRAM_ID } from "../core/constants.js";
-import { createAleoTransaction } from "../core/transaction-helper.js";
+import { requestTransaction, normalizeWalletError } from "../lib/walletAdapter.js";
+import { addPosition } from "../lib/usePositionsStore.js";
 
-// ─── Wallet adapter compat ───────────────────────────────────────────────────
-const extractTxId = (result) =>
-  typeof result === 'string' ? result : (result?.transactionId ?? JSON.stringify(result));
+// (extractTxId no longer needed — walletAdapter.requestTransaction returns a plain string)
 
 // ─── AMM helpers — mirrors Leo finalize exactly ──────────────────────────────
 //
@@ -180,18 +179,22 @@ function PredictionModal({ market, onClose }) {
     if (amtMicro < 100_000) { setTxError('Minimum buy is 0.1 USDCx.'); return; }
     setTxError(''); setTxStatus('');
     setApproveLoading(true);
-    setTxStatus('Requesting USDCx approval…');
+    setTxStatus('Requesting USDCx approval from wallet…');
     try {
-      const tx = createAleoTransaction(
-        publicKey, USDCX_PROGRAM_ID, 'approve_public',
-        [`${PROGRAM_ID}`, `${amtMicro}u128`],
-        500_000
+      const txId = await requestTransaction(
+        wallet?.adapter,
+        {
+          programId: USDCX_PROGRAM_ID,
+          functionName: 'approve_public',
+          inputs: [`${PROGRAM_ID}`, `${amtMicro}u128`],
+          fee: 0.5,
+        },
+        publicKey
       );
-      const txId = extractTxId(await wallet.adapter.executeTransaction(tx));
       setApproved(true);
-      setTxStatus(`✅ Approved! TX: ${txId}\nOnce confirmed, click Buy below.`);
+      setTxStatus(`✅ Approved! TX: ${txId}\nOnce confirmed on-chain (~30s), click Buy below.`);
     } catch (err) {
-      setTxError(err.message || 'Approval failed.');
+      setTxError(normalizeWalletError(err).message);
     } finally {
       setApproveLoading(false);
     }
@@ -219,23 +222,37 @@ function PredictionModal({ market, onClose }) {
       const freshPreview = ammBuy(freshYes, freshNo, amtMicro, position);
       const freshMin     = applySlippage(freshPreview.shares, slippageBps);
 
-      setTxStatus('Submitting buy_shares…');
-      const tx = createAleoTransaction(
-        publicKey, PROGRAM_ID, 'buy_shares',
-        [
-          `${market.market_id}`,  // public market_id
-          `${amtMicro}u128`,      // public amount
-          `${position}`,          // private outcome — ZK hidden ✓
-          `${freshYes}u64`,       // public expected_yes (transition layer AMM)
-          `${freshNo}u64`,        // public expected_no  (transition layer AMM)
-          `${freshMin}u64`,       // public min_shares_out (slippage tolerance)
-          `${freshDeadline}u32`,  // public deadline (block height)
-          `${timestamp}u64`,      // public timestamp
-        ],
-        2_000_000
+      setTxStatus('Waiting for wallet approval (ZK proof may take 1-2 min)…');
+      const txId = await requestTransaction(
+        wallet?.adapter,
+        {
+          programId: PROGRAM_ID,
+          functionName: 'buy_shares',
+          inputs: [
+            `${market.market_id}`,   // public market_id
+            `${amtMicro}u128`,       // public amount
+            `${position}`,           // private outcome — ZK hidden ✓
+            `${freshYes}u64`,        // public expected_yes
+            `${freshNo}u64`,         // public expected_no
+            `${freshMin}u64`,        // public min_shares_out (slippage)
+            `${freshDeadline}u32`,   // public deadline block
+            `${timestamp}u64`,       // public timestamp
+          ],
+          fee: 2.0,
+        },
+        publicKey
       );
-      const txId = extractTxId(await wallet.adapter.executeTransaction(tx));
-      setTxStatus(` Buy submitted! TX: ${txId}\nYour Position record will appear in your wallet once confirmed.`);
+      setTxStatus(`✅ Buy submitted! TX: ${txId}\nYour Position record appears in your wallet once the block finalises.`);
+
+      // Persist position immediately — shows up in MyPositions right away
+      addPosition(publicKey, {
+        txId,
+        marketId:       market.market_id,
+        marketQuestion: market.question,
+        outcome:        position ? 'YES' : 'NO',
+        amountMicro,
+        shares:         freshPreview.shares,
+      });
 
       // Optimistic pool update using the same snapshot sent to contract
       const p = ammBuy(freshYes, freshNo, amtMicro, position);
@@ -280,21 +297,25 @@ function PredictionModal({ market, onClose }) {
       );
       const freshMinPayout = applySlippage(freshSellPreview.payout, slippageBps);
 
-      setTxStatus('Submitting sell_shares…');
-      const tx = createAleoTransaction(
-        publicKey, PROGRAM_ID, 'sell_shares',
-        [
-          `${market.market_id}`,
-          posRecord.trim(),
-          `${position}`,              // private outcome — ZK hidden ✓
-          `${sharesMicro}u64`,        // private share_amount — ZK hidden ✓
-          `${freshMinPayout}u64`,     // public min_payout_out (slippage tolerance)
-          `${freshDeadline}u32`,      // public deadline
-        ],
-        2_000_000
+      setTxStatus('Waiting for wallet approval (ZK proof may take 1-2 min)…');
+      const txId = await requestTransaction(
+        wallet?.adapter,
+        {
+          programId: PROGRAM_ID,
+          functionName: 'sell_shares',
+          inputs: [
+            `${market.market_id}`,    // public market_id
+            posRecord.trim(),          // private Position record — ZK hidden ✓
+            `${position}`,             // private outcome — ZK hidden ✓
+            `${sharesMicro}u64`,       // private share_amount — ZK hidden ✓
+            `${freshMinPayout}u64`,    // public min_payout_out (slippage)
+            `${freshDeadline}u32`,     // public deadline
+          ],
+          fee: 2.0,
+        },
+        publicKey
       );
-      const txId = extractTxId(await wallet.adapter.executeTransaction(tx));
-      setTxStatus(`✅ Sell submitted! TX: ${txId}\nPayout will appear in your claimable balance — use Withdraw to collect.`);
+      setTxStatus(`✅ Sell submitted! TX: ${txId}\nPayout appears in claimable balance — use Withdraw to collect.`);
       const sp = ammSell(chain?.yes ?? yesPool, chain?.no ?? noPool, sharesMicro, position);
       setYesPool(sp.newYes);
       setNoPool(sp.newNo);
@@ -318,7 +339,7 @@ function PredictionModal({ market, onClose }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70" onClick={onClose}>
       <div
-        className="w-full max-w-lg bg-slate-900 rounded-xl shadow-2xl border border-slate-700 max-h-[92vh] overflow-y-auto"
+        className="w-full max-w-lg bg-white dark:bg-slate-900 rounded-xl shadow-2xl border border-gray-200 dark:border-slate-700 max-h-[92vh] overflow-y-auto"
         onClick={e => e.stopPropagation()}
       >
         {market.image && (
@@ -334,8 +355,8 @@ function PredictionModal({ market, onClose }) {
 
           {/* Header */}
           <div className="flex justify-between items-start mb-4">
-            <h3 className="text-lg font-bold text-white flex-1 pr-4">{market.question}</h3>
-            <button onClick={onClose} className="text-slate-400 hover:text-white shrink-0">
+            <h3 className="text-lg font-bold text-gray-900 dark:text-white flex-1 pr-4">{market.question}</h3>
+            <button onClick={onClose} className="text-gray-400 hover:text-gray-700 dark:text-slate-400 dark:hover:text-white shrink-0">
               <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
               </svg>
@@ -343,30 +364,30 @@ function PredictionModal({ market, onClose }) {
           </div>
 
           {/* Pool state */}
-          <div className="mb-4 p-3 rounded-lg bg-slate-800 border border-slate-700 grid grid-cols-3 gap-2 text-center text-xs">
+          <div className="mb-4 p-3 rounded-lg bg-gray-50 dark:bg-slate-800 border border-gray-100 dark:border-slate-700 grid grid-cols-3 gap-2 text-center text-xs">
             <div>
-              <div className="text-slate-400 mb-1">YES pool</div>
-              <div className="text-green-400 font-semibold">{(yesPool / 1e6).toFixed(4)} USDCx</div>
+              <div className="text-gray-500 dark:text-slate-400 mb-1">YES pool</div>
+              <div className="text-green-600 dark:text-green-400 font-semibold">{(yesPool / 1e6).toFixed(4)} USDCx</div>
             </div>
             <div>
-              <div className="text-slate-400 mb-1">NO pool</div>
-              <div className="text-red-400 font-semibold">{(noPool / 1e6).toFixed(4)} USDCx</div>
+              <div className="text-gray-500 dark:text-slate-400 mb-1">NO pool</div>
+              <div className="text-red-600 dark:text-red-400 font-semibold">{(noPool / 1e6).toFixed(4)} USDCx</div>
             </div>
             <div>
-              <div className="text-slate-400 mb-1">Block</div>
-              <div className="text-slate-300 font-mono">{currentBlock || '—'}</div>
+              <div className="text-gray-500 dark:text-slate-400 mb-1">Block</div>
+              <div className="text-gray-700 dark:text-slate-300 font-mono">{currentBlock || '—'}</div>
             </div>
           </div>
 
           {/* Buy / Sell tabs */}
-          <div className="flex gap-1 mb-5 border-b-2 border-slate-700">
+          <div className="flex gap-1 mb-5 border-b-2 border-gray-100 dark:border-slate-700">
             {['Buy', 'Sell'].map((t, i) => (
               <button key={t}
                 onClick={() => { setIsBuy(i === 0); resetFlow(); }}
                 className={`flex-1 pb-3 text-base font-semibold transition-all ${
                   isBuy === (i === 0)
-                    ? 'text-white border-b-2 border-cyan-500 -mb-0.5'
-                    : 'text-slate-400 hover:text-slate-300'
+                    ? 'text-gray-900 dark:text-white border-b-2 border-cyan-500 -mb-0.5'
+                    : 'text-gray-400 dark:text-slate-400 hover:text-gray-600 dark:hover:text-slate-300'
                 }`}>{t}</button>
             ))}
           </div>
@@ -379,9 +400,9 @@ function PredictionModal({ market, onClose }) {
                 <button key={String(s)} onClick={() => { setPosition(s); resetFlow(); }}
                   className={`px-3 py-2.5 rounded-xl font-semibold text-sm transition-all ${
                     position === s
-                      ? s ? 'bg-green-600/30 border-2 border-green-500 text-white'
-                          : 'bg-red-600/30 border-2 border-red-500 text-white'
-                      : 'bg-slate-800 border-2 border-slate-700 text-slate-400 hover:border-slate-600'
+                      ? s ? 'bg-green-600/30 border-2 border-green-500 text-green-700 dark:text-white'
+                          : 'bg-red-600/30 border-2 border-red-500 text-red-700 dark:text-white'
+                      : 'bg-gray-50 dark:bg-slate-800 border-2 border-gray-100 dark:border-slate-700 text-gray-400 dark:text-slate-400 hover:border-gray-300 dark:hover:border-slate-600'
                   }`}>
                   <div>{s ? 'YES' : 'NO'}</div>
                   <div className="text-xs font-normal opacity-80">{s ? yesPct : noPct}¢</div>
@@ -435,7 +456,7 @@ function PredictionModal({ market, onClose }) {
                 <input type="number" value={amount}
                   onChange={e => { setAmount(e.target.value); resetFlow(); }}
                   placeholder="0.00" min="0.1" step="0.1"
-                  className="w-full px-4 py-3 rounded-lg bg-slate-800 border border-slate-700 text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 transition-colors" />
+                  className="w-full px-4 py-3 rounded-lg bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-slate-500 focus:outline-none focus:border-cyan-500 transition-colors" />
               </div>
 
               {/* Buy preview */}
@@ -617,7 +638,7 @@ function PredictionModal({ market, onClose }) {
                 <textarea value={posRecord} onChange={e => setPosRecord(e.target.value)}
                   rows={4}
                   placeholder="{ owner: aleo1..., market_id: ...field.private, yes_shares: ...u64.private, ... }"
-                  className="w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-green-400 text-xs font-mono placeholder-slate-600 focus:outline-none focus:border-cyan-500 resize-none" />
+                  className="w-full px-3 py-2 rounded-lg bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-green-600 dark:text-green-400 text-xs font-mono placeholder-gray-400 dark:placeholder-slate-600 focus:outline-none focus:border-cyan-500 resize-none" />
                 <p className="text-xs text-slate-500 mt-1">
                   Find in your wallet under <strong>{PROGRAM_ID}</strong>.
                   Payout → <strong>claimable</strong> balance → use Withdraw to collect.
@@ -642,7 +663,6 @@ function PredictionModal({ market, onClose }) {
 
           {/* Privacy note */}
           <div className="mt-5 p-3 rounded-lg bg-purple-900/30 border border-purple-700 text-sm text-purple-300 flex items-start gap-2">
-            <span>🔒</span>
             <span>
               <strong>ZK Privacy:</strong> your bet direction (<code>outcome</code>) is a private input —
               never visible in any transaction on-chain. Only the ZK proof is broadcast.

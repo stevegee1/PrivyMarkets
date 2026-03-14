@@ -8,5 +8,15 @@
     "resolution_time": 1767225600,
     "metadata_cid": null,
     "source_of_truth": "https://www.binance.com/en/trade/BTC_USDT"
+  },
+  {
+    "market_id": "6950311251529570264570797455654151374712168239805350666958708762494626693972field",
+    "question": "Will Crude Oil (CL) hit $80 by end of March?",
+    "description": "Resolves YES if the Nymex Crude Oil (CL) price hits $80.00 or higher before March 31, 2026.",
+    "category": "Economics",
+    "image": null,
+    "resolution_time": 1775001600,
+    "metadata_cid": null,
+    "source_of_truth": "https://www.tradingview.com/symbols/NYMEX-CL1!/"
   }
 ]

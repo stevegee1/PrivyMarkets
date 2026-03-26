@@ -1,5 +1,6 @@
 [phases.build]
 cmds = ["npm install --legacy-peer-deps", "npm run build"]
+secrets = []
 
 [start]
 cmd = "npx serve dist -l 3000"

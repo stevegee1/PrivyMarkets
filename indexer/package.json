@@ -1,0 +1,20 @@
+{
+    "name": "privymarkets-indexer",
+    "version": "1.0.0",
+    "description": "Backend indexer service for PrivyMarkets",
+    "type": "module",
+    "scripts": {
+        "index": "tsx src/index-markets.ts",
+        "index:watch": "tsx watch src/index-markets.ts",
+        "build": "tsc",
+        "dev": "tsx watch src/index-markets.ts"
+    },
+    "dependencies": {
+        "node-fetch": "^3.3.2"
+    },
+    "devDependencies": {
+        "@types/node": "^20.10.0",
+        "tsx": "^4.7.0",
+        "typescript": "^5.3.3"
+    }
+}

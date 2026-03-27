@@ -7,6 +7,7 @@ import {
   removePosition,
   updatePosition,
 } from '../lib/usePositionsStore.js';
+import { fetchRecordsViaSDK } from '../core/sdkRecordProvider.js';
 
 // ─── Explorer base ─────────────────────────────────────────────────────────────
 const EXPLORER = 'https://api.provable.com/v2/testnet';
@@ -125,6 +126,38 @@ export default function MyPositions() {
       setEnriched(newEnriched);
     } catch (e) {
       setError('Failed to fetch chain state: ' + e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Auto-Sync Records (Multi-Strategy Hunting) ──────────────────────────
+  const handleAutoSync = async () => {
+    if (!publicKey) return;
+    setLoading(true);
+    setError('');
+    let foundCount = 0;
+    try {
+      // Strategy: Use SDK to find records via Explorer/Provider
+      const records = await fetchRecordsViaSDK(null, PROGRAM_ID, publicKey);
+      
+      if (records && records.length > 0) {
+        for (const record of records) {
+          const txId = record.transaction_id || record.tx_id;
+          if (txId) {
+            updatePosition(publicKey, txId, { plaintext: typeof record === 'string' ? record : JSON.stringify(record) });
+            foundCount++;
+          }
+        }
+      }
+      if (foundCount > 0) {
+        refresh();
+        setError(`✅ Synced ${foundCount} record(s) from on-chain!`);
+      } else {
+        setError('No new unspent records found. If you just bet, wait ~1 min.');
+      }
+    } catch (e) {
+      setError('Auto-sync failed: ' + e.message);
     } finally {
       setLoading(false);
     }
@@ -282,9 +315,16 @@ export default function MyPositions() {
           <button
             onClick={handleEnrich}
             disabled={loading}
-            className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold disabled:opacity-50 transition-colors"
+            className="px-4 py-2 rounded-lg bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-900 dark:text-white text-sm font-semibold disabled:opacity-50 transition-colors"
           >
-            {loading ? 'Refreshing…' : '🔄 Refresh Positions'}
+            {loading ? 'Refreshing…' : '🔄 Refresh Prices'}
+          </button>
+          <button
+            onClick={handleAutoSync}
+            disabled={loading}
+            className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold disabled:opacity-50 transition-colors shadow-sm"
+          >
+            {loading ? 'Syncing…' : '🔍 Auto-Sync Records'}
           </button>
         </div>
       )}
@@ -442,24 +482,48 @@ export default function MyPositions() {
               <div className="flex flex-wrap gap-2 mt-2">
                 {/* SELL — market open */}
                 {(state === 0 || state === null) && shares > 0 && pos.plaintext && (
-                  <button
-                    onClick={() => handleSell(pos)}
-                    disabled={act.loading}
-                    className="px-4 py-2 text-sm font-semibold rounded-lg bg-orange-600 hover:bg-orange-500 text-white disabled:opacity-50 transition-colors"
-                  >
-                    {act.loading && act.status?.includes('Sell') ? 'Submitting…' : `Sell ${pos.outcome}`}
-                  </button>
+                  <div className="flex flex-col gap-1">
+                    <button
+                      onClick={() => handleSell(pos)}
+                      disabled={act.loading}
+                      className="px-4 py-2 text-sm font-semibold rounded-lg bg-orange-600 hover:bg-orange-500 text-white disabled:opacity-50 transition-colors"
+                    >
+                      {act.loading && act.status?.includes('Sell') ? 'Submitting…' : `Sell ${pos.outcome}`}
+                    </button>
+                    <button
+                      onClick={() => {
+                        const cmd = `snarkos developer execute ${PROGRAM_ID} sell_shares "${pos.marketId}" "${pos.plaintext}" "${isYes}" "${shares}u64" "0u64" "999999999u32" --private-key YOUR_KEY --query https://api.provable.com/v2/testnet --priority-fee 1000000`;
+                        navigator.clipboard.writeText(cmd);
+                        alert('CLI command copied!');
+                      }}
+                      className="text-[10px] text-orange-600 font-mono hover:underline text-center"
+                    >
+                      📋 CLI Sell
+                    </button>
+                  </div>
                 )}
 
                 {/* CLAIM — resolved + winner */}
                 {resolved && userWon && !act.pendingWithdraw && !pos.claimed && pos.plaintext && (
-                  <button
-                    onClick={() => handleClaim(pos)}
-                    disabled={act.loading}
-                    className="px-4 py-2 text-sm font-semibold rounded-lg bg-green-600 hover:bg-green-500 text-white disabled:opacity-50 transition-colors"
-                  >
-                    {act.loading ? 'Claiming…' : '🏆 Claim Winnings'}
-                  </button>
+                  <div className="flex flex-col gap-1">
+                    <button
+                      onClick={() => handleClaim(pos)}
+                      disabled={act.loading}
+                      className="px-4 py-2 text-sm font-semibold rounded-lg bg-green-600 hover:bg-green-500 text-white disabled:opacity-50 transition-colors"
+                    >
+                      {act.loading ? 'Claiming…' : '🏆 Claim Winnings'}
+                    </button>
+                    <button
+                      onClick={() => {
+                        const cmd = `snarkos developer execute ${PROGRAM_ID} claim_winnings "${pos.plaintext}" "${pos.marketId}" "0u128" --private-key YOUR_KEY --query https://api.provable.com/v2/testnet --priority-fee 1000000`;
+                        navigator.clipboard.writeText(cmd);
+                        alert('CLI command copied! Note: update payout u128 if needed.');
+                      }}
+                      className="text-[10px] text-green-600 font-mono hover:underline text-center"
+                    >
+                      📋 CLI Claim
+                    </button>
+                  </div>
                 )}
 
                 {/* WITHDRAW — after sell or claim */}
@@ -523,8 +587,9 @@ export default function MyPositions() {
           <strong className="text-slate-800 dark:text-slate-200">💡 How it works</strong>
           <ul className="mt-2 space-y-1 list-disc list-inside">
             <li>Positions are saved locally the moment you place a bet.</li>
-            <li>Click <strong>Refresh Positions</strong> to pull live pool state and resolution status from the chain.</li>
-            <li>To sell or claim, your wallet must have the Position record plaintext. If "Sell" is greyed out, paste your record plaintext from your wallet.</li>
+            <li>Click <strong>Refresh Prices</strong> to pull live pool state and resolution status.</li>
+            <li>Use <strong>Auto-Sync Records</strong> if your Position records aren't showing up (requires a view key for private records).</li>
+            <li><strong>CLI Fallback:</strong> If the wallet fails, you can use <code>snarkos developer execute {PROGRAM_ID} ...</code> to interact directly with the program.</li>
           </ul>
         </div>
       )}

@@ -526,7 +526,7 @@ function AdminMarketCreate({ onMarketCreated }) {
           </p>
           <button type="button" onClick={handleApprove}
             disabled={approveLoading || approveConfirming || approveDone || !publicKey}
-            className={`w-full py-2.5 px-4 rounded-lg text-white text-sm font-semibold transition-colors ${
+            className={`w-full py-2.5 px-4 rounded-lg text-white text-sm font-semibold transition-colors mb-2 ${
               approveDone
                 ? 'bg-green-500 cursor-default'
                 : approveLoading || !publicKey
@@ -538,6 +538,19 @@ function AdminMarketCreate({ onMarketCreated }) {
              : approveDone       ? 'Approved ✓'
              :                    'Approve in Wallet'}
           </button>
+          {publicKey && !approveDone && (
+            <button
+              onClick={() => {
+                const amountMicro = BigInt(formData.initialLiquidity || 2) * 1_000_000n;
+                const cmd = `snarkos developer execute ${USDCX_PROGRAM_ID} approve_public "${PROGRAM_ID}" "${amountMicro}u128" --private-key YOUR_PRIVATE_KEY --query https://api.provable.com/v2/testnet --priority-fee 1000000`;
+                navigator.clipboard.writeText(cmd);
+                alert('CLI command copied!');
+              }}
+              className="w-full py-1 text-[10px] text-amber-700 font-mono hover:underline"
+            >
+              📋 Copy snarkos CLI Approve command
+            </button>
+          )}
           {approveTxId && (
             <p className="text-xs text-amber-700 mt-2 break-all">
               TX: <span className="font-mono">{approveTxId}</span>
@@ -556,7 +569,7 @@ function AdminMarketCreate({ onMarketCreated }) {
             <code>market_id</code>.
           </p>
           <button type="submit" disabled={busy || !approveDone}
-            className={`w-full py-3 px-6 text-white font-semibold rounded-lg shadow-md transition-all ${
+            className={`w-full py-3 px-6 text-white font-semibold rounded-lg shadow-md transition-all mb-2 ${
               busy || !approveDone
                 ? 'bg-purple-300 cursor-not-allowed'
                 : 'bg-gradient-to-r from-purple-600 to-blue-600 hover:shadow-lg hover:-translate-y-0.5'
@@ -565,6 +578,18 @@ function AdminMarketCreate({ onMarketCreated }) {
              : createLoading ? 'Creating Market…'
              :                 'Create Market'}
           </button>
+          {publicKey && approveDone && !busy && (
+            <button
+              onClick={async (e) => {
+                e.preventDefault();
+                // We'd need to pre-compute hashes here for the CLI, similar to handleCreateMarket logic
+                alert('For Create Market CLI, metadata needs to be uploaded to IPFS first. Use the Web UI for the metadata step if possible.');
+              }}
+              className="w-full py-1 text-[10px] text-purple-600 font-mono hover:underline text-center"
+            >
+              ℹ️ CLI for Create Market is complex (IPFS required)
+            </button>
+          )}
           {awaitingRecord && (
             <p className="text-xs text-purple-600 mt-2 text-center animate-pulse">
               Waiting for MarketInfo record to appear in your wallet (up to 2 min)…

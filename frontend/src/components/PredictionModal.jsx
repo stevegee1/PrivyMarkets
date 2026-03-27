@@ -659,7 +659,23 @@ function PredictionModal({ market, onClose }) {
 
           {/* Status / error */}
           {txError  && <div className="mt-4 p-3 rounded-lg bg-red-900/40 border border-red-700 text-red-300 text-sm whitespace-pre-wrap">{txError}</div>}
-          {txStatus && <div className="mt-4 p-3 rounded-lg bg-green-900/40 border border-green-700 text-green-300 text-sm break-all whitespace-pre-wrap">{txStatus}</div>}
+          {txStatus && (
+            <div className="mt-4 p-3 rounded-lg bg-green-900/40 border border-green-700 text-green-300 text-sm break-all whitespace-pre-wrap flex flex-col gap-2">
+              <div>{txStatus}</div>
+              {txStatus.includes('submitted') && (
+                <button
+                  onClick={() => {
+                    const cmd = `snarkos developer execute ${PROGRAM_ID} buy_shares "${market.market_id}" "${amtMicro}u128" "${position}" "${yesPool}u64" "${noPool}u64" "${minSharesOut}u64" "${deadline}u32" "${Math.floor(Date.now()/1000)}u64" --private-key YOUR_PRIVATE_KEY --query https://api.provable.com/v2/testnet --priority-fee 1000000`;
+                    navigator.clipboard.writeText(cmd);
+                    alert('CLI command copied to clipboard!\nRun this in snarkos if the wallet fails.');
+                  }}
+                  className="text-[10px] bg-green-800 hover:bg-green-700 text-white px-2 py-1 rounded w-fit font-mono"
+                >
+                  📋 Copy snarkos CLI command (Fallback)
+                </button>
+              )}
+            </div>
+          )}
 
           {/* Privacy note */}
           <div className="mt-5 p-3 rounded-lg bg-purple-900/30 border border-purple-700 text-sm text-purple-300 flex items-start gap-2">

@@ -12,8 +12,9 @@ program privymarket_v5.aleo {
     mapping vault_balances: field => u64;
     mapping market_states:  field => u8;    // 0=OPEN 1=PAUSED 3=RESOLVED
     mapping market_results: field => bool;  // true=YES won
-    mapping winning_pools:  field => u64;   // snapshotted at resolution
-
+    mapping winning_pools:     field => u64;   // snapshotted at resolution
+    mapping total_fees:        field => u64;   // platform fees accumulated per market
+    mapping resolution_times:  field => u64;   // WAVE 4: stored for resolution window enforcement
 
     mapping claimable: field => u64;
 
@@ -64,13 +65,19 @@ program privymarket_v5.aleo {
         metadata_cid:           field,
         metadata_hash:          field,
         resolution_time:        u64,
-        public initial_amount:  u128
+        public initial_yes:     u128,
+        public initial_no:      u128
     ) -> (MarketInfo, AdminCap, Future) {
 
-        assert(initial_amount >= 2_000_000u128);
-        assert(initial_amount % 2u128 == 0u128);
+        assert(initial_yes >= 1_000_000u128);
+        assert(initial_no  >= 1_000_000u128);
 
-        let market_id: field = BHP256::hash_to_field(metadata_hash);
+        let initial_amount: u128 = initial_yes + initial_no;
+
+        // WAVE 4: Robust Market ID (prevents collisions and reuse)
+        let market_id: field = BHP256::hash_to_field(
+            metadata_hash + resolution_time as field + self.signer as field
+        );
 
         let info: MarketInfo = MarketInfo {
             owner:           self.signer,
@@ -90,13 +97,14 @@ program privymarket_v5.aleo {
 
         return (info, returned_admin, async {
             fut.await();
-            let half: u64 = (initial_amount / 2u128) as u64;
-            Mapping::set(yes_pools,      market_id, half);
-            Mapping::set(no_pools,       market_id, half);
+            Mapping::set(yes_pools,      market_id, initial_yes as u64);
+            Mapping::set(no_pools,       market_id, initial_no  as u64);
             Mapping::set(vault_balances, market_id, initial_amount as u64);
             Mapping::set(market_states,  market_id, 0u8);
             Mapping::set(market_results, market_id, false);
-            Mapping::set(winning_pools,  market_id, 0u64);
+            Mapping::set(winning_pools,     market_id, 0u64);
+            Mapping::set(total_fees,        market_id, 0u64);
+            Mapping::set(resolution_times,  market_id, resolution_time);
         });
     }
 
@@ -224,6 +232,11 @@ program privymarket_v5.aleo {
             Mapping::set(yes_pools,      market_id, store_yes);
             Mapping::set(no_pools,       market_id, store_no);
 
+            // WAVE 4: Fee accumulation (0.3%)
+            let fee: u64 = amt64 * 30u64 / 10_000u64;
+            let current_fees: u64 = Mapping::get_or_use(total_fees, market_id, 0u64);
+            Mapping::set(total_fees, market_id, current_fees + fee);
+
             let cur_vault: u64 = Mapping::get(vault_balances, market_id);
             Mapping::set(vault_balances, market_id, cur_vault + amt64);
         });
@@ -310,9 +323,15 @@ program privymarket_v5.aleo {
             Mapping::set(no_pools,       market_id, store_no);
             Mapping::set(vault_balances, market_id, cur_vault - payout);
 
+            // WAVE 4: Fee accumulation (0.3% on sell)
+            let fee: u64 = payout * 30u64 / 10_000u64;
+            let net_payout: u64 = payout - fee;
+            let current_fees: u64 = Mapping::get_or_use(total_fees, market_id, 0u64);
+            Mapping::set(total_fees, market_id, current_fees + fee);
+
             // ── Credit claimable ─────────────────────────
             let existing: u64 = Mapping::get_or_use(claimable, claimable_key, 0u64);
-            Mapping::set(claimable, claimable_key, existing + payout);
+            Mapping::set(claimable, claimable_key, existing + net_payout);
         });
     }
 
@@ -326,6 +345,11 @@ program privymarket_v5.aleo {
         return (returned_admin, async {
             let state: u8 = Mapping::get(market_states, market_id);
             assert(state == 0u8 || state == 1u8);
+
+            // WAVE 4: Resolution window check
+            // resolution_time is interpreted as block height
+            let res_time: u64 = Mapping::get(resolution_times, market_id);
+            assert(block.height >= res_time as u32);
 
             let win_pool: u64 = winning_outcome
                 ? Mapping::get(yes_pools, market_id)
@@ -385,16 +409,34 @@ program privymarket_v5.aleo {
         };
     }
 
-    // ── Withdraw ────────────────────────────────────────────
+    // ── Withdraw Private ───────────────────────────────────
+    // WAVE 4: Return funds as private records for maximum privacy.
+    async transition withdraw_private(
+        public market_id: field,
+        private amount:   u64
+    ) -> (test_usdcx_stablecoin.aleo/ComplianceRecord, test_usdcx_stablecoin.aleo/Token, Future) {
+
+        let claimable_key: field = BHP256::hash_to_field(
+            self.signer as field + market_id
+        );
+
+        let (compliance, token, fut): (test_usdcx_stablecoin.aleo/ComplianceRecord, test_usdcx_stablecoin.aleo/Token, Future) =
+            test_usdcx_stablecoin.aleo/transfer_public_to_private(
+                self.signer,
+                amount as u128
+            );
+
+        return (compliance, token, async {
+            fut.await();
+            let available: u64 = Mapping::get(claimable, claimable_key);
+            assert(available >= amount);
+            Mapping::set(claimable, claimable_key, available - amount);
+        });
+    }
+
+    // ── Withdraw Public ─────────────────────────────────────
     // Pulls claimable balance to user's public USDCx balance.
-    // Called after sell_shares or claim_winnings.
-    //
-    // For full exit privacy:
-    //   1. Call withdraw() from betting wallet
-    //   2. Wait random delay (2-48 hours)
-    //   3. From a FRESH wallet: call stablecoin/transfer_public_to_private()
-    //   4. Fresh wallet holds private Token with no market trace
-    async transition withdraw(
+    async transition withdraw_public(
         public market_id: field,
         public amount:    u128
     ) -> Future {
@@ -416,6 +458,29 @@ program privymarket_v5.aleo {
             assert(available >= amount as u64);
             Mapping::set(claimable, claimable_key, available - amount as u64);
         };
+    }
+
+    // ── Claim Fees ──────────────────────────────────────────
+    // WAVE 4: Admin can claim accumulated platform fees.
+    async transition claim_fees(
+        admin:            AdminCap,
+        public market_id: field,
+        public amount:    u64
+    ) -> (AdminCap, Future) {
+
+        let returned_admin: AdminCap = AdminCap { owner: admin.owner };
+
+        let fut: Future = test_usdcx_stablecoin.aleo/transfer_public(
+            self.signer, // Admin address
+            amount as u128
+        );
+
+        return (returned_admin, async {
+            fut.await();
+            let available: u64 = Mapping::get(total_fees, market_id);
+            assert(available >= amount);
+            Mapping::set(total_fees, market_id, available - amount);
+        });
     }
 
     // ── Pause Market ────────────────────────────────────────

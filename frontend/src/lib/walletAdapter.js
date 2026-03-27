@@ -36,60 +36,64 @@ export function isLeoWalletInstalled() {
 // ── Poll for on-chain transaction ID ─────────────────────────────────────────
 // Leo Wallet returns a UUID event ID, not the at1... tx ID.
 // ZK proving for complex programs takes 1-3 min — poll every 5s.
-export async function pollForTransactionId(eventId, maxAttempts = 30) {
+export async function pollForTransactionId(eventId, maxAttempts = 40, onChainVerify = null) {
   console.log('[walletAdapter] Polling for on-chain tx ID:', eventId);
 
   const leoWallet = window.leoWallet || window.leo;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Strategy 1: Manual on-chain verification (source of truth)
+    if (onChainVerify && attempt > 0 && attempt % 2 === 0) {
+      try {
+        const verified = await onChainVerify();
+        if (verified) {
+          console.log('[walletAdapter] Dual-Polling: confirmed via manual on-chain verification!');
+          return 'confirmed_manual';
+        }
+      } catch (e) { console.warn('[walletAdapter] Manual verify error:', e); }
+    }
+
+    // Strategy 2: Wallet status API
     try {
       if (leoWallet && typeof leoWallet.transactionStatus === 'function') {
         const status = await leoWallet.transactionStatus(eventId);
 
         if (status) {
           const statusStr = status.status || '';
+          if (statusStr === 'Failed' || statusStr === 'Rejected') return null;
 
-          if (statusStr === 'Failed' || statusStr === 'Rejected') {
-            console.error('[walletAdapter] Transaction FAILED:', status);
-            return null;
-          }
-
-          const onChainId =
-            status.transactionId ||
-            status.transaction_id ||
-            status.txId ||
-            status.id;
-
-          if (onChainId && typeof onChainId === 'string' && onChainId.startsWith('at1')) {
-            console.log('[walletAdapter] Got on-chain tx ID:', onChainId);
-            return onChainId;
-          }
+          const onChainId = status.transactionId || status.transaction_id || status.txId || status.id;
+          if (onChainId && typeof onChainId === 'string' && onChainId.startsWith('at1')) return onChainId;
 
           if ((statusStr === 'Finalized' || statusStr === 'Completed') && status.transaction?.id?.startsWith('at1')) {
             return status.transaction.id;
           }
         }
       }
-    } catch (err) {
-      if (attempt < 2) console.warn(`[walletAdapter] Poll ${attempt + 1} error:`, err);
+    } catch (err) { /* wait and retry */ }
+
+    // Strategy 3: Check explorer directly for the eventId (if supported)
+    if (attempt > 5 && attempt % 3 === 0 && !eventId.startsWith('at1')) {
+      try {
+        const resp = await fetch(`https://api.explorer.provable.com/v1/testnet/transaction/${eventId}`);
+        if (resp.ok) return eventId;
+      } catch { /* wait and retry */ }
     }
 
-    await new Promise(r => setTimeout(r, 5000)); // ZK proving can take 1-3 min
+    await new Promise(r => setTimeout(r, 6000));
   }
 
-  console.warn('[walletAdapter] Could not get on-chain tx ID after', maxAttempts, 'attempts');
   return null;
 }
 
-// ── Core transaction dispatch ─────────────────────────────────────────────────
 /**
  * Dispatch an Aleo transaction with full fallback chain.
  *
  * @param {object} adapter     - The ProvableHQ adapter from useWallet()
- * @param {object} request     - { programId, functionName, inputs, fee }
+ * @param {object} request     - { programId, functionName, inputs, fee, onChainVerify }
  * @returns {Promise<string>}  - Transaction ID (at1... or UUID event ID)
  */
-export async function requestTransaction(adapter, { programId, functionName, inputs, fee = 0.5 }, address = null) {
+export async function requestTransaction(adapter, { programId, functionName, inputs, fee = 0.5, onChainVerify = null }, address = null) {
   // Input validation
   if (!Array.isArray(inputs)) throw new Error('inputs must be an array');
   for (let i = 0; i < inputs.length; i++) {
@@ -184,12 +188,12 @@ export async function requestTransaction(adapter, { programId, functionName, inp
 
   console.log('[walletAdapter] Got tx ID:', txId);
 
-  // If it's a UUID event ID (not at1...), try to get the real on-chain tx ID
+  // If it's a UUID event ID (not at1...), try to get the real on-chain tx ID with Dual-Polling
   if (!txId.startsWith('at1') && txId.includes('-')) {
-    console.log('[walletAdapter] UUID event ID detected, polling for at1... ID');
-    const realTxId = await pollForTransactionId(txId, 30);
+    console.log('[walletAdapter] UUID event ID detected, polling for at1... ID with Dual-Polling');
+    const realTxId = await pollForTransactionId(txId, 40, onChainVerify);
+    if (realTxId === 'confirmed_manual') return txId; // Keep UUID but treat as confirmed
     if (realTxId) return realTxId;
-    console.warn('[walletAdapter] Returning UUID — check Leo Wallet for actual transaction');
   }
 
   return txId;

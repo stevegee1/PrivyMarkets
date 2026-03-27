@@ -4,7 +4,7 @@
 
 [![Built on Aleo](https://img.shields.io/badge/Built%20on-Aleo-blueviolet?style=for-the-badge)](https://aleo.org)
 [![Privacy First](https://img.shields.io/badge/Privacy-First-green?style=for-the-badge)](https://github.com/yourusername/dark-pool-markets)
-[![Zero Knowledge](https://img.shields.io/badge/Zero%20Knowledge-Betting-orange?style=for-the-badge)](https://github.com/yourusername/dark-pool-markets)
+
 
 ---
 
@@ -86,26 +86,20 @@ Consequences:
 │                         │                                    │
 │                         ▼                                    │
 │          ┌──────────────────────────────┐                    │
-│          │    ALEO SMART PROGRAMS       │                    │
+│          │    ALEO SMART PROGRAM        │                    │
 │          │                              │                    │
-│          │  market_manager.aleo         │                    │
-│          │  • Creates markets           │                    │
-│          │  • Tracks public pool totals │                    │
-│          │                              │                    │
-│          │  betting.aleo                │                    │
-│          │  • Private bet placement     │                    │
-│          │  • Hidden positions          │                    │
-│          │                              │                    │
-│          │  resolution.aleo             │                    │
-│          │  • Oracle submits result     │                    │
-│          │  • Private claim winnings    │                    │
+│          │  privymarket_v5.aleo         │                    │
+│          │  • Unified Market Manager    │                    │
+│          │  • AMM (Constant Product)    │                    │
+│          │  • Resolution & Claims       │                    │
+│          │  • Privacy-First Withdrawals │                    │
 │          └──────────────────────────────┘                    │
 │                                                              │
-│  PRIVACY GUARANTEES:                                         │
-│  ✓ Bet amounts are private records                           │
-│  ✓ Positions hidden until claimed                            │
-│  ✓ Only pool totals are public                               │
-│  ✓ Winnings paid out privately                               │
+│  WAVE 4 PRIVACY & SECURITY:                                  │
+│  ✓ Bet outcomes are private Records                          │
+│  ✓ Private Withdrawals (Public-to-Private tokens)            │
+│  ✓ Enforced Resolution Window (No early resolution)          │
+│  ✓ Robust Market IDs (Collision prevention)                  │
 │                                                              │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -116,28 +110,34 @@ Consequences:
 
 ### Market: "Will BTC hit $120,000 by March 2026?"
 
-**Step 1: Oracle Creates Market**
+**Step 1: Admin Creates Market**
 ```leo
 transition create_market(
-    question: field,           // hash("Will BTC hit $120k by March 2025?")
-    resolution_time: u64,      // Unix timestamp: March 1, 2025
-    initial_liquidity: u64     // 10,000 credits (5k YES, 5k NO)
-) -> Market
+    admin: AdminCap,
+    metadata_cid: field,
+    metadata_hash: field,
+    resolution_time: u64,      // Block height for resolution
+    initial_yes: u128,         // Flexible YES liquidity
+    initial_no: u128           // Flexible NO liquidity
+)
 ```
 
-**Result:** Market is live with 50/50 odds (5k YES pool / 5k NO pool)
+**Result:** Market is live. Wave 4 enables **Flexible Initial Pricing** (e.g., seeding a market at 70/30 odds).
 
 ---
 
 **Step 2: Alice Bets $10,000 on YES (Private)**
 
 ```leo
-transition place_bet(
+transition buy_shares(
     market_id: field,
-    position: bool,            // true = YES
-    amount: u64,               // 10,000 credits
-    payment: credits
-) -> (Bet, Market)
+    amount: u128,              // 10,000 USDCx
+    outcome: bool,             // true = YES (ZK-hidden)
+    expected_yes: u64,         // Pool state for slippage check
+    expected_no: u64,
+    min_shares_out: u64,       // Slippage protection
+    deadline: u32              // Staleness protection
+)
 ```
 
 **What happens:**
@@ -166,73 +166,6 @@ record Bet {
 
 ---
 
-**Step 3: Bob Bets $5,000 on NO (Private)**
-
-```leo
-transition place_bet(
-    market_id: field,
-    position: bool,            // false = NO
-    amount: u64,               // 5,000 credits
-    payment: credits
-) -> (Bet, Market)
-```
-
-**Pool Updates:**
-- YES pool: 15,000 (unchanged)
-- NO pool: 5,000 → 10,000
-- New odds: 15,000 / (15,000 + 10,000) = 60% YES
-
-**What's HIDDEN:**
--  Nobody knows Bob bet
--  Nobody knows his amount or position
--  Alice doesn't know Bob bet against her
-
----
-
-**Step 4: Resolution (March 1, 2026)**
-
-Oracle checks: BTC is at $118,000 (did NOT hit $120k)
-
-```leo
-transition resolve_market(
-    market_id: field,
-    result: bool               // false = NO wins
-) -> Market
-```
-
-**Result:** Market resolved, NO bets win
-
----
-
-**Step 5: Bob Claims Winnings (Private)**
-
-```leo
-transition claim_winnings(
-    bet: Bet,
-    resolved_market: Market
-) -> credits
-```
-
-**Calculation:**
-- Bob bet 5,000 on NO at 40% odds
-- Total pool: 25,000 credits
-- NO pool won (10,000 credits bet on NO)
-- Bob's share: (5,000 / 10,000) × 25,000 = 12,500 credits
-- **Bob's profit: 7,500 credits** (150% return)
-
-**What's HIDDEN:**
--  Nobody knows Bob won
--  Nobody knows his payout amount
--  Credits appear in Bob's wallet privately
-
----
-
-**Step 6: Alice's Bet (Lost)**
-
-Alice's Bet record is now worthless (she bet YES, market resolved NO).
-She can burn it or keep it as a receipt, but it has no claim value.
-
-**Privacy maintained:**
 -  Nobody knows Alice lost
 -  Nobody knows she bet 10,000 credits
 -  Her loss is completely private
@@ -260,14 +193,6 @@ She can burn it or keep it as a receipt, but it has no claim value.
 | Total NO pool | Needed for pricing | Cannot attribute to individuals |
 | Market creation | Needed for discovery | Oracle identity visible |
 | Market resolution | Needed for claims | Result is public information |
-
-### What This Does NOT Guarantee
-
-| Limitation | Explanation | Mitigation |
-|------------|-------------|------------|
-|  **Oracle honesty** | Trusted oracle submits result | Future: Multi-sig or token voting |
-|  **Timing attacks** | Large pool changes reveal whale activity | Future: Batched transactions |
-|  **Sybil resistance** | Multiple wallets can bet | Future: ZK identity proofs |
 
 ---
 
@@ -348,26 +273,21 @@ Academic/research predictions without career risk
 
 ## Technical Architecture
 
-### Smart Contract Stack
+### Smart Contract Stack (privymarket_v5.aleo)
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│              ALEO PROGRAMS (Leo)                    │
+│              ALEO PROGRAM (Leo)                     │
 ├─────────────────────────────────────────────────────┤
 │                                                     │
-│  market_manager.aleo                                │
-│  ├─ create_market()                                 │
-│  ├─ add_liquidity()                                 │
-│  └─ resolve_market()                                │
-│                                                     │
-│  betting.aleo                                       │
-│  ├─ place_bet()          [Private Bet Record]       │
-│  ├─ cancel_bet()         [Before resolution]        │
-│  └─ get_current_odds()   [Public view]              │
-│                                                     │
-│  resolution.aleo                                    │
-│  ├─ submit_oracle_result()  [Trusted oracle]        │
-│  └─ claim_winnings()        [Private payout]        │
+│  privymarket_v5.aleo                                │
+│  ├─ create_market()      [Admin Control]            │
+│  ├─ buy_shares()         [Private Outcome PR]       │
+│  ├─ sell_shares()        [AMM Exit]                 │
+│  ├─ resolve_market()     [Enforced Deadline]        │
+│  ├─ claim_winnings()     [Record Verification]      │
+│  ├─ withdraw_private()   [ZK Privacy Exit]          │
+│  └─ claim_fees()         [Protocol Monetization]    │
 │                                                     │
 └─────────────────────────────────────────────────────┘
 ```
@@ -376,234 +296,52 @@ Academic/research predictions without career risk
 
 ## 10-Wave Buildathon Plan
 
-###  Wave 1: Core Market Creation, Private Betting System & Frontend Market Browser
+### ✅ Wave 1 - 3: Core Infrastructure (COMPLETE)
+**Goal:** Market Creation, Private Betting, and Resolution.
 
-**Deliverables:**
--  `market_manager.aleo` program
--  `create_market()` transition
--  Market record structure
--  Deploy to Aleo testnet
--  CLI test script
--  `betting.aleo` program
--  `place_bet()` transition (creates private Bet record)
--  AMM price calculation
--  Pool update logic
-- Web UI for market browser
-
-###  Wave 2: Oracle Resolution System
-**Goal:** Allow oracle to resolve markets and users to claim winnings
-
-**Deliverables:**
--  `resolution.aleo` program
--  `resolve_market()` transition (oracle only)
--  `claim_winnings()` transition (private payout)
--  Payout calculation logic
--  End-to-end test: create → bet → resolve → claim
+**Implemented Features:**
+- [x] **AMM Logic**: Constant Product $x \cdot y = k$ implementation.
+- [x] **Private Positions**: Outcomes are stored as encrypted Records.
+- [x] **Oracle Resolution**: Admin-controlled market settlement.
+- [x] **Winnings Claim**: Private claim logic based on share of winning pool.
+- [x] **Frontend v1**: Market browser and basic betting UI.
 
 ---
 
-### Wave 3: Enhance Frontend - Market Browser
+### ✅ Wave 4: Production Hardening (COMPLETE)
+**Goal:** Security, Privacy Exit, and Monetization
 
-**Deliverables:**
--  React app with Aleo SDK integration
--  Market list view (fetch from chain)
--  Market detail page (pools, odds, resolution time)
--  Aleo wallet connection (Leo Wallet / Puzzle Wallet)
--  Responsive design
-
-**Features:**
-- View all active markets
-- See current odds (calculated from pools)
-- Time to resolution countdown
-- Total volume (yes_pool + no_pool)
-
-**Success Criteria:**
--  Wallet connects successfully
--  Markets display with correct data
--  Odds calculated accurately
--  Mobile responsive
+**Implemented Features:**
+- [x] **Private Withdrawal**: `withdraw_private` returns funds as private records.
+- [x] **Protocol Fees**: 0.3% trading fee for sustainability.
+- [x] **Slippage Protection**: Integrated `min_shares_out` checks.
+- [x] **Staleness Protection**: Block-height `deadline` enforcement.
+- [x] **Resolution Guard**: Cannot resolve market before `resolution_time`.
+- [x] **Flexible Pricing**: Set initial YES/NO liquidity ratios.
+- [x] **Collision Prevention**: Market IDs hashed with signer and time.
+- [x] **Judge-Ready Wiring**: Static indexer, Dual-Polling, and Resilient Record Hunting.
+- [x] **CLI Fallbacks**: Pre-generated `snarkos` commands for all critical actions.
 
 ---
 
-###  Wave 4: Frontend - Bet Placement UI
-**Goal:** Allow users to place bets through UI
+## 🚀 Future Roadmap (Waves 5-10)
+### Wave 5: Decentralization & Advanced Privacy
+Oracle Multi-sig, Batched Transactions, and ZK Identity Proofs.
 
-**Deliverables:**
--  Bet placement modal/form
--  Position selection (YES/NO buttons)
--  Amount input with validation
--  Odds preview (dynamic based on amount)
--  Transaction signing via wallet
--  Success/error handling
+### Wave 6: Position Manager Dashboard
+UI for private bet management and winnings claims.
 
-**Features:**
-- Toggle YES/NO position
-- Amount input with balance check
-- Live odds preview
-- Slippage warning if large bet
-- Privacy reminder ("Your position stays private")
+### Wave 7: Admin Oracle Console
+Control panel for market creation and resolution.
 
-**Success Criteria:**
--  Transaction signs successfully
--  Bet record created (check wallet)
--  Market pools update on chain
--  UI shows confirmation
+### Wave 8: LMSR Pricing & Circuit Breakers
+Logarithmic AMM pricing and volatility protection.
 
----
+### Wave 9: Real-World Data Integration
+Production oracles for Sports, Financial, and Political data.
 
-###  Wave 5: Frontend - Position Manager
-**Goal:** View your private bets and claim winnings
-
-**Deliverables:**
--  "My Bets" dashboard
--  Display owned Bet records from wallet
--  Show bet details (amount, position, entry odds)
--  Market status (active/resolved)
--  Claim winnings button (for winning bets)
--  P&L calculation
-
-
-**Features:**
-- List all your bets
-- Show market status
-- Calculate potential/actual winnings
-- One-click claim for winning bets
-- Privacy reminder (only you see this)
-
-**Success Criteria:**
--  Bets load from wallet
--  Status calculated correctly
--  Claim transaction works
--  Payout amount accurate
-
----
-
-###  Wave 6: Oracle Dashboard
-**Goal:** Admin interface for creating and resolving markets
-
-**Deliverables:**
--  Oracle-only dashboard
--  Market creation form
--  Resolve market interface
--  Market analytics (volume, participants estimate)
--  Access control (only market owner)
-
-**Features:**
-- Create markets with custom questions
-- Set resolution time
-- Add initial liquidity
-- Resolve markets when time comes
-- View market analytics
-
-**Success Criteria:**
--  Only owner can access their markets
--  Market creation works
--  Resolution updates market state
--  Cannot resolve before time
-
----
-
-###  Wave 7: Real-World Demo Markets
-**Goal:** Deploy 3 real prediction markets with actual data
-
-**Deliverables:**
--  Market 1: Crypto ("Will BTC hit $120k by March 2025?")
--  Market 2: Politics ("Will [Event] happen by [Date]?")
--  Market 3: Sports ("Will [Team] win championship?")
--  Initial liquidity in each market
--  Off-chain question storage (IPFS or DB)
--  Oracle resolution plan
-
-
-**Demo Script:**
-1. Show 3 live markets in UI
-2. Walk through bet placement (Alice bets on BTC)
-3. Show privacy (blockchain explorer shows no position)
-4. Fast-forward to resolution time
-5. Oracle resolves market
-6. Winner claims payout privately
-
-**Success Criteria:**
--  3 markets deployed to testnet
--  Questions stored off-chain
--  Markets discoverable in UI
--  Can place test bets on all 3
--  Resolution mechanism tested
-
----
-
-### Wave 8: Privacy + Market Balancing
-**Goal:** Advanced privacy features + prevent one-sided markets
-
-**The Problem:**
-When predictions become obvious (e.g., "BTC will hit $50k" when it's already at $48k), everyone bets YES and the market becomes:
-- **Illiquid** - No counterparty willing to bet NO at 95% YES odds
-- **Stagnant** - Price discovery fails, market stops updating
-- **Unfair** - Late bettors get terrible odds
-
-**New Deliverables:**
-
-**Market Balancing:**
--  **LMSR pricing function** - Logarithmic cost curve keeps spreads tight even when lopsided
--  **10%-90% circuit breakers** - Hard limits prevent absurd odds
--  **Rebalancing function** - Oracle injects liquidity to minority side when odds hit 85%+
--  **UI warning** - Alert users: " Market heavily skewed toward NO. Rebalancing recommended."
-
-**Privacy Enhancements:**
--  Privacy budget system (limit queries per user)
--  Batched bet transactions (hide timing)
--  Odds obfuscation (add noise to prevent exact inference)
--  Documentation of privacy guarantees
-
-
-**Success Criteria:**
--  LMSR pricing compresses extreme odds
--  Circuit breaker rejects bets beyond 10%-90%
--  Oracle can rebalance markets above 85% skew
--  UI shows warnings for heavily skewed markets
--  Privacy budget enforced
--  Batching reduces timing leaks
--  Documentation explains guarantees
-
----
-
-### Wave 9 - 10: Polish & Grand Finale
-**Goal:** Production-ready marketplace with professional presentation
-
-**Deliverables:**
--  All components integrated seamlessly
--  Professional UI/UX design
--  Comprehensive documentation
--  5-minute demo video
--  Pitch deck for judges
--  Deploy to Aleo mainnet/testnet
--  Analytics dashboard
--  Bug fixes and optimization
-
-**Final Checklist:**
-
-**Smart Contracts:**
--  All programs audited (self-audit)
--  Gas optimization
--  Error handling
--  Deployed to testnet
--  Transaction IDs documented
-
-**Frontend:**
--  Mobile responsive
--  Wallet adapter stable
--  Loading states
--  Error messages clear
--  Accessibility (WCAG AA)
--  Dark mode
-
-**Documentation:**
--  README with setup instructions
--  Architecture diagrams
--  API documentation
--  Privacy guarantees explained
--  FAQ section
--  Video tutorial
+### Wave 10: Mainnet Launch
+Final security audits and Aleo Mainnet deployment.
 
 ---
 
@@ -696,30 +434,20 @@ git clone https://github.com/stevegee1/PrivyMarkets.git
 cd PrivyMarkets
 ```
 
-**2. Deploy Smart Contracts:**
+**2. Deploy Smart Contract:**
 ```bash
-cd programs/market_manager
-leo build
-leo deploy --network testnet
-
-cd ../betting
-leo build
-leo deploy --network testnet
-
-cd ../resolution
+cd backend
 leo build
 leo deploy --network testnet
 ```
 
 **3. Configure Frontend:**
 ```bash
-cd ../../frontend
+cd ../frontend
 cp .env.example .env
 
-# Edit .env with your program IDs
-VITE_MARKET_MANAGER_PROGRAM=market_manager.aleo
-VITE_BETTING_PROGRAM=betting.aleo
-VITE_RESOLUTION_PROGRAM=resolution.aleo
+# Edit .env with your program ID
+VITE_MARKET_PROGRAM=privymarket_v5.aleo
 ```
 
 **4. Run Frontend:**
@@ -745,103 +473,54 @@ http://localhost:5173
 
 ---
 
-## Development Workflow
+## CLI Usage (Testing)
 
-### Creating a New Market
-
+### 1. Create Market
 ```bash
-# Via CLI
+# Note: Requires an AdminCap record
 leo run create_market \
-  "$(leo hash 'Will BTC hit $120k by March 2025?')" \
-  "1740000000u64" \
-  "10000u64"
-
-# Via UI
-1. Connect wallet
-2. Navigate to Oracle Dashboard
-3. Click "Create Market"
-4. Fill form and submit
+  "{admin_cap_record}" \
+  "$(leo hash 'metadata_cid')" \
+  "$(leo hash 'metadata_hash')" \
+  "1000u64" \           # Resolution Block Height
+  "1000000000u128" \    # Initial YES (1000 USDCx)
+  "1000000000u128"      # Initial NO (1000 USDCx)
 ```
 
-### Placing a Bet
-
+### 2. Buy Shares (Bet)
 ```bash
-# Via CLI
-leo run place_bet \
-  "{market_record}" \
-  "true" \          # YES position
-  "1000u64" \       # 1000 credits
-  "{payment_record}"
-
-# Via UI
-1. Browse markets
-2. Click market card
-3. Click "Place Bet"
-4. Select YES/NO
-5. Enter amount
-6. Confirm transaction
+leo run buy_shares \
+  "0x123...field" \    # market_id
+  "100000000u128" \    # amount
+  "true" \             # YES position
+  "50000000u64" \      # expected_yes
+  "40000000u64" \      # expected_no
+  "90000000u64" \      # min_shares_out
+  "1000u32"            # deadline (block height)
 ```
 
-### Resolving a Market
-
+### 3. Claim Winnings
 ```bash
-# Via CLI (oracle only)
-leo run resolve_market \
-  "{market_record}" \
-  "false"           # NO won
-
-# Via UI
-1. Oracle Dashboard
-2. Find market (resolution time passed)
-3. Click "Resolve YES" or "Resolve NO"
-```
-
-### Claiming Winnings
-
-```bash
-# Via CLI
 leo run claim_winnings \
-  "{bet_record}" \
-  "{resolved_market_record}"
-
-# Via UI
-1. Navigate to "My Bets"
-2. Find winning bet
-3. Click "Claim Winnings"
-4. Confirm transaction
+  "true" \             # outcome
+  "0x123...field" \    # market_id
+  "150000000u64"       # expected_payout
 ```
 
 ---
 
 ## Testing
 
-### Unit Tests
-
+### Smart Contract Tests
 ```bash
-cd programs/betting
+cd backend
 leo test
 ```
 
-### Integration Tests
-
-```bash
-# Full flow test
-./scripts/test-flow.sh
-
-# Expected output:
-✓ Market created
-✓ Bet 1 placed (Alice: 1000 YES)
-✓ Bet 2 placed (Bob: 500 NO)
-✓ Market resolved (NO wins)
-✓ Bob claimed 1500 credits
-✓ Privacy verified (positions not visible on explorer)
-```
-
-### Frontend Tests
-
+### Frontend Development
 ```bash
 cd frontend
-npm run test
+npm run dev
 ```
 
 ---
@@ -850,13 +529,12 @@ npm run test
 
 ### Threat Model
 
-| Threat | Mitigation | Status |
-|--------|------------|--------|
-| **Position Inference** | Private Bet records |  Mitigated |
-| **Amount Inference** | Encrypted on-chain |  Mitigated |
-| **Timing Correlation** | Batched transactions |  Wave 9 |
-| **Whale Identification** | Noise in pool updates |  Wave 9 |
-| **Oracle Manipulation** | Multi-sig (future) |  Centralized (MVP) |
+| Threat | Mitigation |
+|--------|------------|
+| **Position Inference** | Private outcome records (ZK-hidden) |
+| **Amount Inference** | Encrypted token transfers |
+| **Early Resolution** | Enforced block height window |
+| **Collision Attacks** | Admin-specific market hashing |
 
 ### Privacy Guarantees
 
@@ -979,6 +657,5 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Status
 
 **Testnet Deployment:**
-- Market Manager: `market_manager_123.aleo`
-- Betting: `betting_456.aleo`
-- Resolution: `resolution_789.aleo`
+- Unified Program: `privymarket_v5.aleo`
+- Assets: `test_usdcx_stablecoin.aleo`

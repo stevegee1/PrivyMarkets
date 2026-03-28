@@ -493,14 +493,14 @@ leo run create_market \
 
 ### 2. Buy Shares (Bet)
 ```bash
+# privymarket_v6.aleo — P4: expected_yes/no removed, finalize is authoritative
 leo run buy_shares \
   "0x123...field" \    # market_id
   "100000000u128" \    # amount
-  "true" \             # YES position
-  "50000000u64" \      # expected_yes
-  "40000000u64" \      # expected_no
-  "90000000u64" \      # min_shares_out
-  "1000u32"            # deadline (block height)
+  "true" \             # YES position (ZK-private)
+  "90000000u64" \      # min_shares_out (slippage tolerance)
+  "1000u32" \          # deadline (block height)
+  "1711612800u64"      # timestamp (unix seconds)
 ```
 
 ### 3. Claim Winnings

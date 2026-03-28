@@ -201,9 +201,8 @@ function PredictionModal({ market, onClose }) {
   };
 
   // ── Step 2: Buy ───────────────────────────────────────────────────────────
-  // Contract signature:
-  //   buy_shares(market_id, amount, outcome, expected_yes, expected_no,
-  //              min_shares_out, deadline, timestamp)
+  // Contract signature (privymarket_v6.aleo — P4: expected_yes/no removed):
+  //   buy_shares(market_id, amount, outcome, min_shares_out, deadline, timestamp)
   const handleBuy = async () => {
     if (!publicKey) { setTxError('Connect your wallet first.'); return; }
     if (!approved)  { setTxError('Complete Step 1 (Approve) first.'); return; }
@@ -232,8 +231,7 @@ function PredictionModal({ market, onClose }) {
             `${market.market_id}`,   // public market_id
             `${amtMicro}u128`,       // public amount
             `${position}`,           // private outcome — ZK hidden ✓
-            `${freshYes}u64`,        // public expected_yes
-            `${freshNo}u64`,         // public expected_no
+            // P4: expected_yes / expected_no removed — finalize is authoritative
             `${freshMin}u64`,        // public min_shares_out (slippage)
             `${freshDeadline}u32`,   // public deadline block
             `${timestamp}u64`,       // public timestamp
@@ -665,7 +663,7 @@ function PredictionModal({ market, onClose }) {
               {txStatus.includes('submitted') && (
                 <button
                   onClick={() => {
-                    const cmd = `snarkos developer execute ${PROGRAM_ID} buy_shares "${market.market_id}" "${amtMicro}u128" "${position}" "${yesPool}u64" "${noPool}u64" "${minSharesOut}u64" "${deadline}u32" "${Math.floor(Date.now()/1000)}u64" --private-key YOUR_PRIVATE_KEY --query https://api.provable.com/v2/testnet --priority-fee 1000000`;
+                    const cmd = `snarkos developer execute ${PROGRAM_ID} buy_shares "${market.market_id}" "${amtMicro}u128" "${position}" "${minSharesOut}u64" "${deadline}u32" "${Math.floor(Date.now()/1000)}u64" --private-key YOUR_PRIVATE_KEY --query https://api.provable.com/v2/testnet --priority-fee 1000000`;
                     navigator.clipboard.writeText(cmd);
                     alert('CLI command copied to clipboard!\nRun this in snarkos if the wallet fails.');
                   }}

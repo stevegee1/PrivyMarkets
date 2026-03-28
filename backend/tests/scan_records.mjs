@@ -21,7 +21,7 @@ const BLOCKS_TO_SCAN = parseInt(process.env.SCAN_BLOCKS || '500');
 // Programs whose records we care about
 const PROGRAMS_OF_INTEREST = [
   'test_usdcx_stablecoin.aleo',
-  'privymarkets_v5.aleo',
+  'privymarket_v6.aleo',
 ];
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ async function main() {
   const latest = Number(latestBlock.header.metadata.height);
   const startBlock = Math.max(0, latest - BLOCKS_TO_SCAN);
 
-  console.log(`🔍  Scanning blocks ${startBlock} → ${latest} (last ${BLOCKS_TO_SCAN} blocks)…`);
+  console.log(`  Scanning blocks ${startBlock} → ${latest} (last ${BLOCKS_TO_SCAN} blocks)…`);
   console.log('    This may take 30–60 seconds.\n');
 
   const foundRecords = [];

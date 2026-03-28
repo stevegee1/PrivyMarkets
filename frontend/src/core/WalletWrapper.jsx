@@ -19,16 +19,11 @@ function ShieldReconnectGuard({ children }) {
         const onDisconnect = () => {
             if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
             reconnectTimer.current = setTimeout(() => {
-                // Only reconnect if Shield already has a stored session
-                // (i.e. the disconnect was spurious, not intentional)
                 const hasSession = !!localStorage.getItem('shield-wallet-session')
                     || !!sessionStorage.getItem('shield-wallet-session')
                     || !!localStorage.getItem('shieldWalletConnected');
 
                 if (hasSession && !connecting) {
-                    // Call connect() with NO extra args — Shield reads its own
-                    // stored config. Passing network/decrypt again triggers
-                    // another "network changed" event and a fresh disconnect loop.
                     connect().catch(() => {});
                 }
             }, 1_000);
@@ -45,24 +40,29 @@ function ShieldReconnectGuard({ children }) {
 }
 
 // ── Main wrapper ─────────────────────────────────────────────────────────────
+// Mirror Veiled Market pattern:
+//   - ShieldWalletAdapter gets NO constructor args
+//   - decryptPermission and programs go to AleoWalletProvider
 export const WalletWrapper = ({ children }) => {
     const wallets = useMemo(() => [
-        new ShieldWalletAdapter({
-            appName:           "PrivyMarkets",
-            // Declare programs and decrypt at construction time only.
-            // Passing them again to connect() makes Shield treat them as a
-            // network change and fire another disconnect.
-            programs:          [PROGRAM_ID, USDCX_PROGRAM_ID],
-            decryptPermission: DecryptPermission.UponRequest,
-            network:           Network.TESTNET,
-        })
+        new ShieldWalletAdapter()
     ], []);
 
     return (
         <AleoWalletProvider
             wallets={wallets}
-            autoConnect={false}
             network={Network.TESTNET}
+            autoConnect={true}
+            decryptPermission={DecryptPermission.AutoDecrypt}
+            programs={[
+                PROGRAM_ID,
+                USDCX_PROGRAM_ID,
+                'credits.aleo',
+                // Transitive dependencies of test_usdcx_stablecoin.aleo
+                'merkle_tree.aleo',
+                'test_usdcx_multisig_core.aleo',
+                'test_usdcx_freezelist.aleo',
+            ]}
             onError={(err) => {
                 const msg = err?.message ?? '';
                 if (

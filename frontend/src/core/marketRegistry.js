@@ -93,26 +93,21 @@ export async function loadAllMarkets() {
   const results = await Promise.all(
     source.map(async (entry) => {
       const id = entry.marketId || entry.market_id;
-      if (!id) {
-        console.warn("Source entry missing market_id:", entry);
-        return null;
+      if (!id) return null;
+
+      const cleanId = String(id).replace(/\.private$|\.public$/, "").trim();
+
+      // Try to get live on-chain state — but NEVER drop the market if chain is unreachable
+      let chain = null;
+      try {
+        chain = await fetchMarketOnChainState(cleanId);
+      } catch (e) {
+        console.warn(`[registry] Chain fetch skipped for ${cleanId}:`, e.message);
       }
 
-      // Ensure id format is clean
-      const idStr = String(id);
-      const cleanId = idStr.replace(/\.private$|\.public$/, "").trim();
-
-      try {
-        const chain = await fetchMarketOnChainState(cleanId);
-        if (!chain) {
-          console.warn(`market_states[${cleanId}] returned null`);
-        }
-
       return {
-        // React key + identifier
         id:              cleanId,
         market_id:       cleanId,
-        // Static metadata from source
         question:        entry.question        || entry.metadata?.question || null,
         description:     entry.description     || entry.metadata?.description || null,
         category:        entry.category        || entry.metadata?.category || "General",
@@ -120,19 +115,15 @@ export async function loadAllMarkets() {
         resolution_time: entry.resolution_time || entry.metadata?.resolution_time || 0,
         metadata_cid:    entry.metadata_cid    || null,
         source_of_truth: entry.source_of_truth || null,
-        // Live on-chain state — fall back to zeros if API unavailable
-        yes_pool:        chain?.yes_pool     ?? 0,
-        no_pool:         chain?.no_pool      ?? 0,
-        vault:           chain?.vault        ?? 0,
-        state:           chain?.state        ?? 0,
+        // Live on-chain state — fall back to static index values or zeros
+        yes_pool:        chain?.yes_pool     ?? entry.yes_pool    ?? 0,
+        no_pool:         chain?.no_pool      ?? entry.no_pool     ?? 0,
+        vault:           chain?.vault        ?? entry.vault       ?? 0,
+        state:           chain?.state        ?? entry.state       ?? 0,
         resolved:        chain?.resolved     ?? false,
-        result:          chain?.result       ?? false,
+        result:          chain?.result       ?? entry.result      ?? false,
         winning_pool:    chain?.winning_pool ?? 0,
-        };
-      } catch (e) {
-        console.error(`Error loading market ${cleanId}:`, e);
-        return null;
-      }
+      };
     }),
   );
 

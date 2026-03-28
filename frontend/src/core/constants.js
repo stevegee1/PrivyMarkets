@@ -1,5 +1,5 @@
-// Program ID for PrivyMarkets — v5 (approve+transfer_from_public, no MerkleProofs)
-export const PROGRAM_ID = "privymarket_v5.aleo";
+// Program ID for PrivyMarkets — v6 (Wave 4 hardened: P1-P5 applied)
+export const PROGRAM_ID = "privymarket_v6.aleo";
 
 // USDCx uses 6 decimal places — same convention as real USDC
 // 1 USDCx = 1_000_000 micro-USDCx

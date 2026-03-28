@@ -273,21 +273,21 @@ Academic/research predictions without career risk
 
 ## Technical Architecture
 
-### Smart Contract Stack (privymarket_v5.aleo)
+### Smart Contract Stack (privymarket_v6.aleo)
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │              ALEO PROGRAM (Leo)                     │
 ├─────────────────────────────────────────────────────┤
 │                                                     │
-│  privymarket_v5.aleo                                │
+│  privymarket_v6.aleo                                │
 │  ├─ create_market()      [Admin Control]            │
-│  ├─ buy_shares()         [Private Outcome PR]       │
-│  ├─ sell_shares()        [AMM Exit]                 │
+│  ├─ buy_shares()         [Private Outcome + AMM]    │
+│  ├─ sell_shares()        [AMM Exit + Double-Dip Guard]  │
 │  ├─ resolve_market()     [Enforced Deadline]        │
 │  ├─ claim_winnings()     [Record Verification]      │
 │  ├─ withdraw_private()   [ZK Privacy Exit]          │
-│  └─ claim_fees()         [Protocol Monetization]    │
+│  └─ withdraw_public()    [Public Exit]              │
 │                                                     │
 └─────────────────────────────────────────────────────┘
 ```
@@ -309,12 +309,16 @@ Academic/research predictions without career risk
 ---
 
 ### ✅ Wave 4: Production Hardening (COMPLETE)
-**Goal:** Security, Privacy Exit, and Monetization
+**Goal:** Security, Privacy Exit, AMM Precision & Protocol Resilience
 
 **Implemented Features:**
 - [x] **Private Withdrawal**: `withdraw_private` returns funds as private records.
-- [x] **Protocol Fees**: 0.3% trading fee for sustainability.
-- [x] **Slippage Protection**: Integrated `min_shares_out` checks.
+- [x] **AMM Fees Embedded (P5)**: 0.3% fee stays in pool as liquidity (no separate `claim_fees`).
+- [x] **Vault Invariant (P1)**: `assert(vault >= yes_pool + no_pool)` enforced after every state change.
+- [x] **Double-Dip Guard (P2)**: `position_consumed` mapping prevents re-selling or re-claiming a spent position.
+- [x] **Ceil Division (P3)**: All AMM divisions round in the protocol's favour — prevents rounding exploitation.
+- [x] **No Snapshot Params (P4)**: `expected_yes/no` removed from `buy_shares`; finalize is authoritative.
+- [x] **Slippage Protection**: `min_shares_out` / `min_payout_out` checks.
 - [x] **Staleness Protection**: Block-height `deadline` enforcement.
 - [x] **Resolution Guard**: Cannot resolve market before `resolution_time`.
 - [x] **Flexible Pricing**: Set initial YES/NO liquidity ratios.
@@ -657,5 +661,5 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Status
 
 **Testnet Deployment:**
-- Unified Program: `privymarket_v5.aleo`
+- Unified Program: `privymarket_v6.aleo`
 - Assets: `test_usdcx_stablecoin.aleo`

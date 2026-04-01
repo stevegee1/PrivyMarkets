@@ -13,12 +13,12 @@ import CreateMarketModal from '../components/CreateMarketModal';
 const TABS = [
   { id: 'All',           label: '🔥 Trending' },
   { id: 'Crypto',        label: 'Crypto' },
+  { id: 'AI',            label: 'AI' },
+  { id: 'Tech',          label: 'Tech' },
+  { id: 'Macro',         label: 'Finance' },
+  { id: 'Defi',          label: 'DeFi' },
   { id: 'Politics',      label: 'Politics' },
   { id: 'Sports',        label: 'Sports' },
-  { id: 'Tech',          label: 'Tech' },
-  { id: 'Economics',     label: 'Finance' },
-  { id: 'Entertainment', label: 'Culture' },
-  { id: 'Science',       label: 'Science' },
   { id: 'General',       label: 'General' },
 ];
 
@@ -71,7 +71,9 @@ export default function Dashboard() {
   const filtered = useMemo(() => {
     if (!Array.isArray(markets)) return [];
     let list = markets.filter(m => m && !m.resolved && m.state !== 3);
-    if (category !== 'All') list = list.filter(m => (m.category || 'General') === category);
+    if (category !== 'All') list = list.filter(m =>
+      (m.category || 'General').toLowerCase() === category.toLowerCase()
+    );
     if (search.trim()) {
       const q = search.toLowerCase();
       list = list.filter(m => m.question?.toLowerCase().includes(q));

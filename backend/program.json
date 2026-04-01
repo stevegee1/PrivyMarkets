@@ -3,7 +3,7 @@
   "version": "0.6.0",
   "description": "",
   "license": "MIT",
-  "leo": "3.5.0",
+  "leo": "4.0.0",
   "dependencies": [
     {
       "name": "test_usdcx_stablecoin.aleo",

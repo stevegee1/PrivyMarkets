@@ -3,6 +3,15 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "initialize":    "node 0_initialize.mjs",
+    "check-state":   "node 1_check_state.mjs",
+    "create-market": "node 2_create_market.mjs",
+    "buy":           "node 3_buy_shares.mjs",
+    "sell":          "node 3b_sell_shares.mjs",
+    "resolve":       "node 4_resolve_and_claim.mjs",
+    "lifecycle":     "node 5_full_lifecycle_check.mjs",
+    "admin":         "node 6_admin_controls.mjs",
+    "scan-records":  "node scan_records.mjs"
   },
   "dependencies": {
     "@provablehq/sdk": "latest",

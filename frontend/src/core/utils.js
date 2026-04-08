@@ -339,17 +339,28 @@ export async function requestDecryptedRecords(
  * @param {Array} records - Array of credit records
  * @param {BigInt} requiredAmount - Amount needed in microcredits
  * @param {string} publicKey - Owner's public key
- * @returns {Object|null} Suitable record or null
+ * @returns {Object} Result with { record, totalBalance, recordCount, largestAmount }
  */
 export function findPaymentRecord(records, requiredAmount, publicKey) {
+  const result = {
+    record: null,
+    totalBalance: 0n,
+    recordCount: 0,
+    largestAmount: 0n,
+    unformattableCount: 0,
+  };
+
   if (!records || records.length === 0) {
     console.log("No records provided");
-    return null;
+    return result;
   }
 
   console.log(
     `Searching ${records.length} records for ${requiredAmount} microcredits...`,
   );
+
+  let bestRecord = null;
+  let bestAmount = 0n;
 
   for (const record of records) {
     // Skip spent records
@@ -361,6 +372,7 @@ export function findPaymentRecord(records, requiredAmount, publicKey) {
     const formatted = formatRecordInput(record);
     if (!formatted) {
       console.log(`Skipping unformattable record: ${record.id}`);
+      result.unformattableCount++;
       continue;
     }
 
@@ -378,12 +390,25 @@ export function findPaymentRecord(records, requiredAmount, publicKey) {
 
     console.log(`Record ${record.id}: ${amount} microcredits`);
 
+    result.totalBalance += amount;
+    result.recordCount++;
+
+    if (amount > bestAmount) {
+      bestAmount = amount;
+      bestRecord = record;
+    }
+
     if (amount >= requiredAmount) {
       console.log(`Found suitable record: ${record.id}`);
-      return record;
+      result.record = record;
+      result.largestAmount = bestAmount;
+      return result;
     }
   }
 
-  console.log("No suitable record found");
-  return null;
+  result.largestAmount = bestAmount;
+  console.log(
+    `No single record found. Total balance: ${result.totalBalance} across ${result.recordCount} records. Largest: ${result.largestAmount}`,
+  );
+  return result;
 }

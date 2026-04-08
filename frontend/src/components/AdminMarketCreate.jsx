@@ -1,669 +1,613 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { useWallet } from '@provablehq/aleo-wallet-adaptor-react';
 import { uploadToIPFS, uploadImageToIPFS } from '../utils/ipfs';
-import { PROGRAM_ID } from "../core/constants.js";
+import { PROGRAM_ID, USDCX_PROGRAM_ID } from "../core/constants.js";
 import { createAleoTransaction } from "../core/transaction-helper.js";
 
+// ── Shared UI helpers ────────────────────────────────────────────────────────
+function StepBadge({ n, done }) {
+  return (
+    <span className={`flex items-center justify-center w-6 h-6 rounded-full text-xs font-bold shrink-0 ${
+      done ? 'bg-green-500 text-white' : 'bg-amber-500 text-white'
+    }`}>
+      {done ? '✓' : n}
+    </span>
+  );
+}
 
+// ── Field encoding ───────────────────────────────────────────────────────────
+// Truncate SHA-256 to fit in an Aleo field element (< ~8×10^76).
+// We take the first 60 hex chars (240 bits) which is safely below
+// the BLS12-377 scalar field modulus.
+const toField = (buf) => {
+  const hex = Array.from(new Uint8Array(buf))
+    .map(b => b.toString(16).padStart(2, '0')).join('');
+  return `${BigInt('0x' + hex.substring(0, 60)).toString()}field`;
+};
+
+// ── Market ID resolution ─────────────────────────────────────────────────────
+// The contract computes: market_id = BHP256::hash_to_field(metadata_hash)
+// We CANNOT reproduce BHP256 in JS, so we CANNOT pre-compute market_id.
+// Instead, after TX confirms we read the MarketInfo record from the wallet —
+// it contains market_id as a plaintext field we can use directly.
+const extractMarketIdFromRecord = (record) => {
+  // Handles both decrypted object shape and plaintext string shape.
+  if (!record) return null;
+
+  // Object shape: { data: { market_id: { ... } } }
+  if (typeof record === 'object') {
+    const raw = record?.data?.market_id;
+    if (raw) {
+      const s = typeof raw === 'object' ? (raw.value ?? raw.plaintext ?? JSON.stringify(raw)) : String(raw);
+      // Strip ".private" / ".public" suffix and trailing "field" type annotation
+      return s.replace(/\.(private|public)$/, '').trim();
+    }
+    // Plaintext string stored on record directly
+    if (record.market_id) return String(record.market_id).replace(/\.(private|public)$/, '').trim();
+  }
+
+  // Plaintext string shape: "{ owner: ..., market_id: 123456field.private, ... }"
+  if (typeof record === 'string') {
+    const m = record.match(/market_id\s*:\s*([\d\-]+field)/);
+    if (m) return m[1];
+  }
+
+  return null;
+};
+
+// ── Poll for MarketInfo record ────────────────────────────────────────────────
+// Polls wallet.requestRecords until a fresh unspent MarketInfo record appears
+// whose metadata_hash matches what we just submitted.
+const pollForMarketInfo = async (adapter, metadataHashField, maxWaitMs = 120_000) => {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    try {
+      const records = await adapter.requestRecords(PROGRAM_ID);
+      const candidates = (records || []).filter(r =>
+        r.recordName === 'MarketInfo' && r.spent === false
+      );
+      for (const rec of candidates) {
+        // Match on metadata_hash field
+        const hash = typeof rec === 'object'
+          ? (rec?.data?.metadata_hash?.value ?? rec?.data?.metadata_hash ?? rec?.metadata_hash)
+          : null;
+        const hashStr = hash ? String(hash).replace(/\.(private|public)$/, '').trim() : '';
+        // metadataHashField is e.g. "12345field" — compare core number
+        const expectedCore = metadataHashField.replace('field', '');
+        if (hashStr === expectedCore || hashStr === metadataHashField) {
+          return rec;
+        }
+      }
+      // Also return the most recently created MarketInfo if only one exists
+      if (candidates.length === 1) return candidates[0];
+    } catch { /* keep polling */ }
+    await new Promise(r => setTimeout(r, 5_000));
+  }
+  return null;
+};
 
 function AdminMarketCreate({ onMarketCreated }) {
   const { wallet, address: publicKey } = useWallet();
+
   const [formData, setFormData] = useState({
-    question: '',
-    description: '',
-    category: 'Crypto',
-    resolutionDate: '',
-    initialLiquidity: '5',
-    sourceOfTruth: '',
+    question:          '',
+    description:       '',
+    category:          'Crypto',
+    resolutionDate:    '',
+    initialLiquidity:  '10',
+    sourceOfTruth:     '',
     resolverAuthority: '',
   });
-  const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState('');
-  const [error, setError] = useState('');
-  const [imageFile, setImageFile] = useState(null);
-  const [imagePreview, setImagePreview] = useState(null);
 
-  const handleChange = (e) => {
-    setFormData({ ...formData, [e.target.name]: e.target.value });
-  };
+  const [imageFile,    setImageFile]    = useState(null);
+  const [imagePreview, setImagePreview] = useState(null);
+  const [adminCap,     setAdminCap]     = useState('');
+
+  // Step state
+  const [approveLoading,    setApproveLoading]    = useState(false);
+  const [approveDone,       setApproveDone]        = useState(false);
+  const [approveTxId,       setApproveTxId]        = useState('');
+  const [approveConfirming, setApproveConfirming]  = useState(false);
+  const [createLoading,     setCreateLoading]      = useState(false);
+  const [awaitingRecord,    setAwaitingRecord]      = useState(false);
+  const [status,            setStatus]             = useState('');
+  const [error,             setError]              = useState('');
+  const [createdMarket,     setCreatedMarket]       = useState(null);
+  const [registryCopied,    setRegistryCopied]      = useState(false);
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  const extractTxId = (result) =>
+    typeof result === 'string' ? result : (result?.transactionId ?? JSON.stringify(result));
+
+  const handleChange = (e) => setFormData({ ...formData, [e.target.name]: e.target.value });
 
   const handleImageChange = (e) => {
     const file = e.target.files[0];
-    if (file) {
-      // Validate file type
-      if (!file.type.startsWith('image/')) {
-        setError('Please select a valid image file');
-        return;
-      }
-      // Validate file size (max 5MB)
-      if (file.size > 5 * 1024 * 1024) {
-        setError('Image size must be less than 5MB');
-        return;
-      }
-
-      setImageFile(file);
-      setError('');
-
-      // Create preview
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setImagePreview(reader.result);
-      };
-      reader.readAsDataURL(file);
-    }
+    if (!file) return;
+    if (!file.type.startsWith('image/')) { setError('Please select a valid image file'); return; }
+    if (file.size > 5 * 1024 * 1024)    { setError('Image size must be less than 5MB');  return; }
+    setImageFile(file);
+    setError('');
+    const reader = new FileReader();
+    reader.onloadend = () => setImagePreview(reader.result);
+    reader.readAsDataURL(file);
   };
 
-  const [adminCap, setAdminCap] = useState(''); // Store the AdminCap record string
-  const [availableRecords, setAvailableRecords] = useState([]);
-
-  const handleFetchRecords = async () => {
-      if (!wallet || !wallet.adapter) return;
-      setLoading(true);
-      setStatus("Fetching AdminCap records from wallet...");
-      try {
-          if (wallet.adapter.requestRecords) {
-              const records = await wallet.adapter.requestRecords(PROGRAM_ID);
-              console.log("=== ALL FETCHED RECORDS ===");
-              console.log("Total count:", records ? records.length : 0);
-              if (records) {
-                  records.forEach((r, idx) => {
-                      console.log(`\n--- Record ${idx} ---`);
-                      console.log("recordName:", r.recordName);
-                      console.log("program_id:", r.program_id);
-                      console.log("owner:", r.owner);
-                      console.log("spent:", r.spent);
-                      console.log("data keys:", r.data ? Object.keys(r.data) : 'NO DATA');
-                      console.log("Full record:", r);
-                  });
-              }
-
-              // Filter for AdminCap records only (not Market records) AND exclude spent ones
-              const adminCapRecords = records ? records.filter(r =>
-                  (r.recordName === 'AdminCap' || (r.data && !r.data.market_id)) &&
-                  r.spent === false  // CRITICAL: Only use unspent records!
-              ) : [];
-
-              console.log("\n=== FILTERED AdminCap RECORDS ===");
-              console.log("AdminCap count:", adminCapRecords.length);
-              console.log("Unspent AdminCap records:", adminCapRecords);
-              setAvailableRecords(adminCapRecords);
-
-              // Auto-select the first AdminCap record if available
-              if (adminCapRecords && adminCapRecords.length > 0) {
-                  const firstRecord = adminCapRecords[0];
-
-                  console.log("✅ Selected UNSPENT AdminCap record:", firstRecord);
-                  console.log("Record ID:", firstRecord.id);
-                  console.log("Record spent status:", firstRecord.spent);
-
-                  // Store the record object directly - browser wallet uses objects, not plaintext
-                  setAdminCap(firstRecord);
-                  setStatus(`Loaded unspent AdminCap (ID: ${firstRecord.id.substring(0, 8)}...)`);
-              } else {
-                  setStatus("No AdminCap records found in wallet. Please run Initialize first or paste manually.");
-              }
-          } else {
-              setError("Wallet does not support record fetching");
-          }
-      } catch (err) {
-          console.error("Failed to fetch records:", err);
-          setError("Failed to fetch records: " + (err.message || JSON.stringify(err)));
-      } finally {
-          setLoading(false);
-      }
-  };
-
-  // Robust Record Input Formatter
-  // Returns Plaintext String (if possible) OR Record Object (if nonce missing)
   const formatRecordInput = (record) => {
-      // 1. If explicit plaintext exists, use it
-      if (record.plaintext) return record.plaintext;
-
-      // 2. Extract properties
-      const owner = record.owner;
-      const data = record.data || {};
-
-      // Try to find nonce in various places
-      const nonce = record.nonce || record._nonce || data.nonce || data._nonce;
-
-      if (!nonce) {
-          console.warn("Missing nonce for record, passing Object reference:", record);
-          // Fallback: Return the Object itself. The Wallet Adapter can often look it up by ID.
-          // Do NOT JSON.stringify it (that creates an invalid string).
-          return record;
-      }
-
-      // 3. Construct specific record plaintext if we have nonce
-      // AdminCap
-      if (record.recordName === 'AdminCap' || (data._version && !data.microcredits)) {
-             return `{
-  owner: ${owner}.private,
-  _nonce: ${nonce},
-  _version: ${data._version || '1u8.public'}
-}`;
-      }
-
-      // Credits
-      if (record.program_id === 'credits.aleo' || data.microcredits) {
-          return `{
-  owner: ${owner}.private,
-  microcredits: ${data.microcredits},
-  _nonce: ${nonce}
-}`;
-      }
-
-      // Generic reconstruction
-      let fields = [`  owner: ${owner}.private`];
-      if (nonce) fields.push(`  _nonce: ${nonce}`);
-      for (const [key, val] of Object.entries(data)) {
-          if (key === '_nonce') continue;
-          fields.push(`  ${key}: ${val}`);
-      }
-      return `{\n${fields.join(',\n')}\n}`;
+    if (typeof record === 'string') return record;
+    if (record.plaintext)           return record.plaintext;
+    const owner = record.owner;
+    const data  = record.data || {};
+    const nonce = record.nonce || record._nonce || data.nonce || data._nonce;
+    if (owner && nonce) {
+      const version = data._version || '1u8.public';
+      return `{\n  owner: ${owner}.private,\n  _nonce: ${nonce},\n  _version: ${version}\n}`;
+    }
+    if (record.recordCiphertext) return record.recordCiphertext;
+    return JSON.stringify(record);
   };
 
-  const handleInitialize = async () => {
-      if (!publicKey) return;
-      setLoading(true);
-      setStatus("Initializing protocol (Minting AdminCap)...");
-      try {
-          const transaction = createAleoTransaction(
-              publicKey,
-              PROGRAM_ID,
-              'initialize',
-              [],
-              10000
-          );
-          if (wallet.adapter && wallet.adapter.executeTransaction) {
-              const txId = await wallet.adapter.executeTransaction(transaction);
-              setStatus(`Initialization Sent! ID: ${txId}. Wait for it to settle, then copy your AdminCap record from your wallet.`);
-          }
-      } catch (err) {
-          console.error("Initialize Error:", err);
-          let msg = err.message || JSON.stringify(err);
-          if (msg.includes("No records for fee")) {
-              msg = "Insufficient public credits for transaction fee (3.0 credits). Please request tokens from the Aleo Faucet.";
-          }
-          setError("Initialization failed: " + msg);
-      } finally {
-          setLoading(false);
-      }
-  };
-
-  // Helper to convert public credits to private
-  const handleShield = async (amount) => {
+  // ── Fetch AdminCap ────────────────────────────────────────────────────────
+  const handleFetchRecords = async () => {
+    if (!wallet?.adapter) return;
+    setCreateLoading(true);
+    setError('');
+    setStatus('Fetching AdminCap records from wallet...');
     try {
-      setStatus('Requesting Public -> Private conversion...');
-
-      const amountMicrocredits = BigInt(amount) * 1_000_000n;
-      // Inputs: [receiver, amount]
-      const inputs = [
-        publicKey,                      // receiver (self)
-        `${amountMicrocredits}u64`      // amount
-      ];
-
-      const transaction = createAleoTransaction(
-        publicKey,
-        'credits.aleo',
-        'transfer_public_to_private',
-        inputs,
-        200000,
-        false
+      if (!wallet.adapter.requestRecords) {
+        setError('Wallet does not support record fetching.');
+        return;
+      }
+      const records = await wallet.adapter.requestRecords(PROGRAM_ID);
+      const adminCapRecords = (records || []).filter(r =>
+        r.recordName === 'AdminCap' && r.spent === false
       );
-
-      const tx = await wallet.adapter.executeTransaction(transaction);
-
-      console.log('Shield Transaction:', tx);
-      alert('Conversion submitted! Please wait for it to confirm, then try creating the market again.');
-      setStatus('');
-      setLoading(false);
+      if (adminCapRecords.length === 0) {
+        setStatus('No AdminCap found. Run Initialize first.');
+        return;
+      }
+      const raw = adminCapRecords[0];
+      if (raw.owner && raw.data) {
+        setAdminCap(raw);
+        setStatus('Loaded AdminCap (decrypted).');
+        return;
+      }
+      if (raw.recordCiphertext) {
+        setStatus('Decrypting AdminCap record...');
+        const adapter = wallet.adapter;
+        let plaintext = null;
+        try {
+          if (adapter.decryptRecord) plaintext = await adapter.decryptRecord(raw.recordCiphertext);
+          else if (adapter.decrypt)  plaintext = await adapter.decrypt(raw.recordCiphertext);
+        } catch (decryptErr) {
+          console.warn('Decrypt attempt failed:', decryptErr);
+        }
+        if (plaintext) {
+          setAdminCap(plaintext);
+          setStatus('AdminCap decrypted and loaded.');
+        } else {
+          setAdminCap(raw.recordCiphertext);
+          setStatus('AdminCap loaded as ciphertext. Shield will decrypt on submit.');
+        }
+        return;
+      }
+      setAdminCap('');
+      setStatus('Unexpected record format. Paste AdminCap plaintext manually.\n\nRaw:\n' + JSON.stringify(raw, null, 2));
     } catch (err) {
-      console.error('Shield failed:', err);
-      alert('Shielding failed: ' + err.message);
-      setStatus('');
-      setLoading(false);
+      setError('Failed to fetch records: ' + (err.message || JSON.stringify(err)));
+    } finally {
+      setCreateLoading(false);
     }
   };
 
+  // ── Initialize ────────────────────────────────────────────────────────────
+  const handleInitialize = async () => {
+    if (!publicKey) return;
+    setCreateLoading(true);
+    setStatus('Minting AdminCap...');
+    try {
+      const tx = createAleoTransaction(publicKey, PROGRAM_ID, 'initialize', [], 500_000);
+      const txId = extractTxId(await wallet.adapter.executeTransaction(tx));
+      setStatus(`Initialized! TX: ${txId}\nClick "Fetch AdminCap" once confirmed.`);
+    } catch (err) {
+      setError('Initialize failed: ' + (err.message || JSON.stringify(err)));
+    } finally {
+      setCreateLoading(false);
+    }
+  };
+
+  // ── Poll TX confirmation ──────────────────────────────────────────────────
+  const pollTxConfirmed = useCallback(async (shieldTxId, intervalMs = 4000, maxWaitMs = 180_000) => {
+    const adapter  = wallet?.adapter;
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      try {
+        const rawStatus = await adapter.transactionStatus(shieldTxId);
+        const s = (
+          typeof rawStatus === 'string'
+            ? rawStatus
+            : rawStatus?.status ?? rawStatus?.transactionStatus ?? rawStatus?.state ?? ''
+        ).toLowerCase().trim();
+        setStatus(`Waiting for approval to confirm on-chain...\nShield status: ${s || '(pending)'}`);
+        if (s === 'finalized' || s === 'completed' || s === 'accepted') return true;
+        if (s === 'rejected'  || s === 'failed')                        return false;
+      } catch { /* blip — keep polling */ }
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+    return false;
+  }, [wallet?.adapter]);
+
+  // ── Step 1: Approve ───────────────────────────────────────────────────────
+  const handleApprove = async () => {
+    if (!publicKey) { setError('Connect your wallet first.'); return; }
+    setError('');
+    setApproveLoading(true);
+    setStatus('Requesting USDCx approval...');
+    try {
+      const amountMicro = BigInt(formData.initialLiquidity || 2) * 1_000_000n;
+      const tx = createAleoTransaction(
+        publicKey, USDCX_PROGRAM_ID, 'approve_public',
+        [`${PROGRAM_ID}`, `${amountMicro}u128`],
+        500_000
+      );
+      const txId = extractTxId(await wallet.adapter.executeTransaction(tx));
+      setApproveTxId(txId);
+      setApproveLoading(false);
+      setApproveConfirming(true);
+      setStatus(`Approval submitted (TX: ${txId}).\nWaiting for on-chain confirmation...`);
+      const confirmed = await pollTxConfirmed(txId);
+      if (confirmed) {
+        setApproveDone(true);
+        setStatus('Approval confirmed. You can now create the market.');
+      } else {
+        setError(`Approval TX rejected or timed out.\nhttps://explorer.provable.com/transaction/${txId}`);
+      }
+    } catch (err) {
+      setError('Approval failed: ' + (err.message || JSON.stringify(err)));
+      setApproveLoading(false);
+    } finally {
+      setApproveConfirming(false);
+    }
+  };
+
+  // ── Step 2: Create Market ─────────────────────────────────────────────────
   const handleCreateMarket = async (e) => {
     e.preventDefault();
     setError('');
     setStatus('');
 
-    if (!publicKey) {
-      setError('Please connect your wallet first.');
-      return;
-    }
+    if (!publicKey)   { setError('Connect your wallet first.'); return; }
+    if (!adminCap)    { setError('AdminCap record required. Click "Fetch AdminCap" above.'); return; }
+    if (!approveDone) { setError('Complete Step 1 (Approve USDCx) before creating a market.'); return; }
 
-    if (!adminCap) {
-        setError('Please provide an AdminCap record. Run Initialize if you have none.');
-        return;
-    }
-
-    setLoading(true);
+    setCreateLoading(true);
     try {
-      // 1. Upload Image to IPFS (if provided)
+      // ── Upload image ────────────────────────────────
       let imageCid = null;
       if (imageFile) {
         setStatus('Uploading image to IPFS...');
-        try {
-          imageCid = await uploadImageToIPFS(imageFile);
-          console.log('Image CID:', imageCid);
-        } catch (imgError) {
-          console.error('Image upload failed:', imgError);
-          setError('Image upload failed. Continuing without image...');
-          // Continue without image
-        }
+        try { imageCid = await uploadImageToIPFS(imageFile); } catch { /* continue without image */ }
       }
 
-      // 2. Upload Metadata to IPFS
+      // ── Upload metadata ─────────────────────────────
       setStatus('Uploading metadata to IPFS...');
       const metadata = {
-        question: formData.question,
-        description: formData.description || '',
-        image: imageCid, // Add image CID to metadata
-        outcomes: ["YES", "NO"], // Binary for now
-        category: formData.category,
-        resolution_criteria: formData.description, // Using description as criteria for now
-        source_of_truth: formData.sourceOfTruth,
-        resolver_authority: formData.resolverAuthority || publicKey, // Default to creator
-        dispute_rules: "Standard Optimistic Oracle",
-        created_at: new Date().toISOString(),
+        question:            formData.question,
+        description:         formData.description || '',
+        image:               imageCid,
+        outcomes:            ['YES', 'NO'],
+        category:            formData.category,
+        resolution_criteria: formData.description,
+        source_of_truth:     formData.sourceOfTruth,
+        resolver_authority:  formData.resolverAuthority || publicKey,
+        dispute_rules:       'Standard Optimistic Oracle',
+        created_at:          new Date().toISOString(),
       };
       const cid = await uploadToIPFS(metadata);
-      console.log('IPFS CID:', cid);
 
-      // 2. Prepare Aleo Transaction
-      setStatus('Preparing transaction...');
+      // ── Encode fields ───────────────────────────────
+      const enc           = new TextEncoder();
+      const jsonBytes     = enc.encode(JSON.stringify(metadata));
+      const cidBytes      = enc.encode(cid);
+      const metaHashBuf   = await crypto.subtle.digest('SHA-256', jsonBytes);
+      const cidHashBuf    = await crypto.subtle.digest('SHA-256', cidBytes);
 
-      // Convert Date to Unix Timestamp (u64)
-      const resolutionTime = Math.floor(new Date(formData.resolutionDate).getTime() / 1000);
+      // These are passed as-is to the contract.
+      // The contract derives market_id = BHP256::hash_to_field(metadata_hash)
+      // which we cannot reproduce in JS — see Step 3 below.
+      const metadataHashField  = toField(metaHashBuf);
+      const metadataCidField   = toField(cidHashBuf);
+      const resolutionTime     = Math.floor(new Date(formData.resolutionDate).getTime() / 1000);
+      const initialAmountMicro = BigInt(formData.initialLiquidity) * 1_000_000n;
+      const adminCapInput      = formatRecordInput(adminCap);
 
-      // Hash CID to Field (Simplified for Hackathon: Use a placeholder or hash)
-      // Since we can't easily hash a string to field in JS compatible with Poseidon on-chain without strict encoding,
-      // we will use a random field or a simple numeric representation for the uniqueness.
-      // Ideally: hash of the question text.
-      // For now: We'll pass a random field value as 'question_hash' and assume off-chain indexing links it to IPFS.
-      // A better approach in production: Store CID on-chain (as u128 chunks).
-
-      // 3. Compute Hashes
-      const jsonString = JSON.stringify(metadata);
-      const encoder = new TextEncoder();
-      const data = encoder.encode(jsonString);
-      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-      const hashArray = Array.from(new Uint8Array(hashBuffer));
-      const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
-      const metadataHashBigInt = BigInt('0x' + hashHex.substring(0, 60)); // Safe fit for u256/field
-
-      const cidData = encoder.encode(cid);
-      const cidHashBuffer = await crypto.subtle.digest('SHA-256', cidData);
-      const cidHashArray = Array.from(new Uint8Array(cidHashBuffer));
-      const cidHashHex = cidHashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-      const metadataCidBigInt = BigInt('0x' + cidHashHex.substring(0, 60));
-
-      // Log the AdminCap for debugging
-      console.log('AdminCap being used:', adminCap);
-
-      // Validate AdminCap
-      let adminCapInput = formatRecordInput(adminCap);
-      if (typeof adminCapInput !== 'string' && !adminCapInput.id) {
-           console.warn("Admin Cap input is questionable:", adminCapInput);
-      }
-
-      // If string, verify owner. If object, assume valid.
-      if (typeof adminCapInput === 'string' && !adminCapInput.includes('owner')) {
-          throw new Error('Invalid AdminCap format: ' + adminCapInput);
-      }
-
-      // --- NEW: Find Credit Record for Initial Liquidity ---
-      setStatus('Finding credit record for liquidity...');
-      let suitableCreditRecord = null;
-
-      if (wallet.adapter && wallet.adapter.requestRecords) {
-          try {
-              const credits = await wallet.adapter.requestRecords("credits.aleo");
-              const requiredMicrocredits = BigInt(formData.initialLiquidity) * 1_000_000n;
-
-              // Find a record with enough balance
-              suitableCreditRecord = credits.find(r => {
-                  if (r.spent) return false;
-                  // Handle different data formats (e.g. "1000u64.private")
-                  let amount = 0n;
-                  if (r.data && r.data.microcredits) {
-                      // Correctly parse '100u64.private' -> '100'
-                      // Split by 'u' to ignore the suffix (u64)
-                      const cleanAmount = r.data.microcredits.split('u')[0];
-                      try {
-                          amount = BigInt(cleanAmount);
-                      } catch (e) {
-                          console.error("Error parsing amount:", r.data.microcredits, e);
-                      }
-                  }
-                  return amount >= requiredMicrocredits;
-              });
-
-              if (!suitableCreditRecord) {
-                   const shouldShield = confirm(
-                     `Insufficient PRIVATE credits detected.\n\n` +
-                     `Required: ${formData.initialLiquidity} Private ALEO\n` +
-                     `Would you like to convert Public ALEO to Private ALEO now?`
-                   );
-
-                   if (shouldShield) {
-                      await handleShield(formData.initialLiquidity);
-                      return; // Exit to let shielding complete
-                   }
-
-                   throw new Error(
-                     `No SINGLE unspent PRIVATE credit record found with at least ${formData.initialLiquidity} credits.\n` +
-                     `1. Check your **Private** balance (not Public).\n` +
-                     `2. Convert Public -> Private in your wallet if needed (Privacy tab).\n` +
-                     `3. If split across records, send credits to yourself to merge.`
-                   );
-              }
-              console.log(" Selected Credit Record:", suitableCreditRecord);
-          } catch (fetchErr) {
-              console.error("Error fetching credit records:", fetchErr);
-              setStatus('');
-              setLoading(false);
-              // Allow error to bubble up or handle gracefully
-              if (fetchErr.message.includes('No SINGLE unspent')) {
-                 alert(fetchErr.message);
-                 return;
-              }
-              throw new Error("Failed to find credit records in wallet. Ensure you have enough credits.");
-          }
-      } else {
-          throw new Error("Wallet does not support record fetching.");
-      }
-
-      // Convert to microcredits for the transaction (1 credit = 1,000,000 microcredits)
-      const initialAmountMicrocredits = BigInt(formData.initialLiquidity) * 1_000_000n;
-
-      // Generate a unique Market ID (field)
-      const marketIdVal = BigInt(Date.now()) + BigInt(Math.floor(Math.random() * 1000));
-      const marketIdField = `${marketIdVal}field`;
-
-      const inputs = [
-        adminCapInput,                              // 1. admin
-        marketIdField,                              // 2. market_id (NEW)
-        `${metadataCidBigInt.toString()}field`,     // 2. metadata_cid
-        `${metadataHashBigInt.toString()}field`,    // 3. metadata_hash
-        `${resolutionTime}u64`,                     // 4. resolution_time
-        formatRecordInput(suitableCreditRecord),    // 5. initial_credits (Use Formatter)
-        `${initialAmountMicrocredits.toString()}u64` // 6. initial_amount
-      ];
-
-      console.log('Transaction inputs:', inputs);
-
-      const transaction = createAleoTransaction(
-        publicKey,
-        PROGRAM_ID,
-        'create_market',
-        inputs,
-        5000,
+      // ── Submit TX ───────────────────────────────────
+      setStatus('Submitting create_market transaction...');
+      const tx = createAleoTransaction(
+        publicKey, PROGRAM_ID, 'create_market',
+        [
+          adminCapInput,
+          metadataCidField,
+          metadataHashField,
+          `${resolutionTime}u64`,
+          `${initialAmountMicro}u128`,
+        ],
+        3_000_000,
         false
       );
+      const txId = extractTxId(await wallet.adapter.executeTransaction(tx));
+      setStatus(`Market TX submitted! TX: ${txId}\n\nNow waiting for MarketInfo record to appear in your wallet so we can read the on-chain market_id.\nThis usually takes 1–2 minutes...`);
 
+      // ── Step 3: Read market_id from MarketInfo record ──
+      // We CANNOT compute BHP256::hash_to_field(metadata_hash) in JS.
+      // The only reliable source of truth is the MarketInfo record
+      // the contract emits — it contains market_id as a plaintext field.
+      setAwaitingRecord(true);
+      const marketInfoRecord = await pollForMarketInfo(
+        wallet.adapter,
+        metadataHashField,
+        120_000
+      );
+      setAwaitingRecord(false);
 
-      setStatus('Requesting wallet signature...');
-      if (wallet.adapter && wallet.adapter.executeTransaction) {
-         const txId = await wallet.adapter.executeTransaction(transaction);
-         setStatus(`Transaction Sent! ID: ${txId}`);
-
-         // Notify parent (OPTIMISTIC API UPDATE for Hackathon demo)
-         // In real app: Wait for tx confirmation or indexer
-          // Construct the full market object
-          const newMarket = {
-              id: marketIdField, // Using the Actual Market ID
-              market_id: marketIdField, // explicit field for trading
-              question: formData.question,
-              description: formData.description,
-              outcomes: ["Yes", "No"],
-              category: formData.category,
-              image: imageCid,
-              yes_pool: Number(formData.initialLiquidity) / 2,
-              no_pool: Number(formData.initialLiquidity) / 2,
-              resolution_time: resolutionTime,
-              state: 0,
-              resolved: false,
-              recordPlaintext: null // Not needed for Public Mapping markets
-          };
-
-          // Update local state (Optimistic)
-          onMarketCreated(newMarket);
-
-          // Generate Shareable Link
-          const shareLink = `${window.location.origin}/?market=${encodeURIComponent(JSON.stringify(newMarket))}`;
-
-          // Update Status with Shareable Link
-          setStatus(
-            `✅ Market created! \n\n` +
-            `� **SHAREABLE LINK** (Send this to users):\n\n` +
-            shareLink
-          );
-
-
-          // Copy to clipboard safely
-          if (navigator.clipboard) {
-              navigator.clipboard.writeText(shareLink).then(() => alert("Link copied to clipboard!")).catch(console.error);
-          }
-          // Let's rely on user copying from the status box for MVP, effectively replacing the JSON block.
-
-          // Auto-refresh AdminCap - DISABLED to keep Success Status visible
-          // setTimeout(async () => {
-          //   try {
-          //      await handleFetchRecords();
-          //   } catch (ignore) {}
-          // }, 1500);
-       } else {
-           throw new Error("Wallet adapter does not support transaction request");
-       }
-
-    } catch (err) {
-      console.error('Market creation failed:', err);
-      // Detailed error logging
-      console.error('Error details:', {
-          message: err.message,
-          stack: err.stack,
-          full: err
-      });
-      let errorMsg = err.message || 'Failed to create market.';
-      if (errorMsg.includes('No records for fee')) {
-          errorMsg = 'Insufficient credits for transaction fee (3.0 credits). Please request tokens from the Aleo Faucet.';
+      let marketId = null;
+      if (marketInfoRecord) {
+        marketId = extractMarketIdFromRecord(marketInfoRecord);
+        setStatus(` Market created! TX: ${txId}\nOn-chain market_id: ${marketId}`);
+      } else {
+        // Fallback: couldn't read record in time (wallet sync lag).
+        setStatus(
+          `Market TX confirmed: ${txId}\n\n` +
+          `⚠️ Could not auto-read market_id from wallet within 2 minutes.\n` +
+          `Open your Shield wallet → Records → MarketInfo and copy the market_id field.\n` +
+          `Replace PENDING_... below with the real market_id before adding to markets.json.`
+        );
+        marketId = `PENDING_${metadataHashField}`;
       }
-      setError(errorMsg);
+
+      // Build the registry entry the admin needs to paste into public/markets.json
+      setCreatedMarket({
+        market_id:       marketId,
+        question:        formData.question,
+        description:     formData.description || '',
+        category:        formData.category,
+        image:           imageCid || null,
+        resolution_time: resolutionTime,
+        metadata_cid:    cid || null,
+        source_of_truth: formData.sourceOfTruth || null,
+      });
+
+      onMarketCreated({
+        id:              marketId,
+        market_id:       marketId,
+        question:        formData.question,
+        description:     formData.description,
+        outcomes:        ['YES', 'NO'],
+        category:        formData.category,
+        image:           imageCid,
+        yes_pool:        Number(formData.initialLiquidity) / 2,
+        no_pool:         Number(formData.initialLiquidity) / 2,
+        resolution_time: resolutionTime,
+        state:           0,
+        resolved:        false,
+        ipfs_cid:        cid,
+      });
+
+      setApproveDone(false);
+      setApproveTxId('');
+    } catch (err) {
+      let msg = err.message || 'Failed to create market.';
+      if (msg.includes('No records for fee'))
+        msg = 'Insufficient credits (need 3.0 Aleo). Get tokens from the Aleo Faucet.';
+      setError(msg);
     } finally {
-      setLoading(false);
+      setCreateLoading(false);
+      setAwaitingRecord(false);
     }
   };
 
+  const busy = approveLoading || approveConfirming || createLoading || awaitingRecord;
 
   return (
     <div className="max-w-2xl mx-auto bg-white rounded-xl shadow-md overflow-hidden p-8 border border-gray-100">
       <div className="flex justify-between items-center mb-6">
-          <div className="flex items-center space-x-3">
-            <div className="p-3 bg-purple-100 rounded-lg">
-              <svg className="w-6 h-6 text-purple-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-              </svg>
-            </div>
-            <h2 className="text-2xl font-bold text-gray-800">Create Private Market</h2>
+        <div className="flex items-center space-x-3">
+          <div className="p-3 bg-purple-100 rounded-lg">
+            <svg className="w-6 h-6 text-purple-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+            </svg>
           </div>
-          <div className="flex gap-2">
-              <button
-                  onClick={handleFetchRecords}
-                  disabled={loading}
-                  className={`text-sm font-medium py-2 px-4 rounded-lg transition-colors ${
-                      loading
-                      ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
-                      : 'bg-blue-100 hover:bg-blue-200 text-blue-700'
-                  }`}
-              >
-                  {loading ? 'Fetching...' : 'Fetch AdminCap'}
-              </button>
-              <button
-                  onClick={handleInitialize}
-                  disabled={loading}
-                  className={`text-sm font-medium py-2 px-4 rounded-lg transition-colors ${
-                      loading
-                      ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
-                      : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
-                  }`}
-              >
-                  {loading ? 'Initializing...' : 'Initialize Protocol'}
-              </button>
-          </div>
+          <h2 className="text-2xl font-bold text-gray-800">Create Private Market</h2>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={handleFetchRecords} disabled={busy}
+            className="text-sm font-medium py-2 px-4 rounded-lg bg-blue-100 hover:bg-blue-200 text-blue-700 disabled:opacity-40 transition-colors">
+            Fetch AdminCap
+          </button>
+          <button onClick={handleInitialize} disabled={busy}
+            className="text-sm font-medium py-2 px-4 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700 disabled:opacity-40 transition-colors">
+            Initialize Protocol
+          </button>
+        </div>
       </div>
 
       <form onSubmit={handleCreateMarket} className="space-y-6">
-        {/* Admin Cap Input */}
-        <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200 mb-6">
-            <label className="block text-sm font-medium text-yellow-800 mb-1">
-                Admin Capability Record
-            </label>
-            <textarea
-                value={typeof adminCap === 'object' ? JSON.stringify(adminCap, null, 2) : (adminCap || '')}
-                onChange={(e) => setAdminCap(e.target.value)}
-                placeholder={`{\n  owner: aleo1abc...,\n  _nonce: 123...group.public,\n  _version: 1u8.public\n}`}
-                className="w-full px-4 py-2 rounded-lg border border-yellow-300 focus:ring-2 focus:ring-yellow-500 text-sm font-mono"
-                rows="5"
-                readOnly={typeof adminCap === 'object'}
-            />
-            <p className="text-xs text-yellow-700 mt-1">
-                Click "Fetch AdminCap" above to auto-load from wallet, or paste manually from CLI output.
-            </p>
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Market Question</label>
-          <input
-            type="text"
-            name="question"
-            required
-            placeholder="e.g., Will BTC hit $100k by 2025?"
-            className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
-            value={formData.question}
-            onChange={handleChange}
+
+        <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200">
+          <label className="block text-sm font-medium text-yellow-800 mb-1">Admin Capability Record</label>
+          <textarea
+            value={typeof adminCap === 'object' ? JSON.stringify(adminCap, null, 2) : (adminCap || '')}
+            onChange={(e) => setAdminCap(e.target.value)}
+            placeholder={'{\n  owner: aleo1abc....private,\n  _nonce: 626231...group.public,\n  _version: 1u8.public\n}'}
+            className="w-full px-4 py-2 rounded-lg border border-yellow-300 focus:ring-2 focus:ring-yellow-500 text-sm font-mono"
+            rows="5"
           />
+          <p className="text-xs text-yellow-700 mt-1">
+            Click "Fetch AdminCap" to auto-load, or paste the plaintext record manually from your Shield wallet.
+          </p>
         </div>
 
-        {/* Image Upload Field */}
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">
-            Market Image (Optional)
-          </label>
-          <input
-            type="file"
-            accept="image/*"
-            onChange={handleImageChange}
-            className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 transition-all file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-purple-50 file:text-purple-700 hover:file:bg-purple-100"
-          />
-          <p className="text-xs text-gray-500 mt-1">
-            Upload an image for your market (max 5MB, JPG/PNG/GIF)
-          </p>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Market Question</label>
+          <input type="text" name="question" required
+            placeholder="e.g., Will BTC hit $100k by end of 2025?"
+            className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 transition-all"
+            value={formData.question} onChange={handleChange} />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Market Image (optional)</label>
+          <input type="file" accept="image/*" onChange={handleImageChange}
+            className="w-full px-4 py-2 rounded-lg border border-gray-300 text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-purple-50 file:text-purple-700 hover:file:bg-purple-100" />
+          <p className="text-xs text-gray-500 mt-1">Max 5 MB — JPG / PNG / GIF</p>
           {imagePreview && (
-            <div className="mt-3">
-              <p className="text-sm text-gray-600 mb-2">Preview:</p>
-              <img
-                src={imagePreview}
-                alt="Market preview"
-                className="max-w-xs rounded-lg border border-gray-200 shadow-sm"
-              />
-            </div>
+            <img src={imagePreview} alt="preview"
+              className="mt-3 max-w-xs rounded-lg border border-gray-200 shadow-sm" />
           )}
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-             <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Category</label>
-                <select
-                    name="category"
-                    className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 transition-all"
-                    value={formData.category}
-                    onChange={handleChange}
-                >
-                    <option value="Crypto">Crypto</option>
-                    <option value="Politics">Politics</option>
-                    <option value="Sports">Sports</option>
-                    <option value="Tech">Tech</option>
-                </select>
-             </div>
-             <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Source of Truth (URL)</label>
-                <input
-                    type="text"
-                    name="sourceOfTruth"
-                    placeholder="e.g. binance.com/btc"
-                    className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 transition-all"
-                    value={formData.sourceOfTruth}
-                    onChange={handleChange}
-                />
-             </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Category</label>
+            <select name="category"
+              className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 transition-all"
+              value={formData.category} onChange={handleChange}>
+              <option>Crypto</option><option>Politics</option>
+              <option>Sports</option><option>Tech</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Source of Truth (URL)</label>
+            <input type="text" name="sourceOfTruth" placeholder="e.g. binance.com/btc"
+              className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 transition-all"
+              value={formData.sourceOfTruth} onChange={handleChange} />
+          </div>
         </div>
 
         <div>
-           <label className="block text-sm font-medium text-gray-700 mb-1">Resolution Criteria / Description</label>
-           <textarea
-             name="description"
-             rows="3"
-             placeholder="Detailed resolution criteria..."
-             className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
-             value={formData.description}
-             onChange={handleChange}
-           />
+          <label className="block text-sm font-medium text-gray-700 mb-1">Resolution Criteria / Description</label>
+          <textarea name="description" rows="3"
+            placeholder="Detailed resolution criteria..."
+            className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 transition-all"
+            value={formData.description} onChange={handleChange} />
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Resolution Date</label>
-            <input
-              type="date"
-              name="resolutionDate"
-              required
-              className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
-              value={formData.resolutionDate}
-              onChange={handleChange}
-            />
+            <input type="date" name="resolutionDate" required
+              className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 transition-all"
+              value={formData.resolutionDate} onChange={handleChange} />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Initial Liquidity (Credits)</label>
-            <input
-              type="number"
-              name="initialLiquidity"
-              required
-              min="2"
-              className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
-              value={formData.initialLiquidity}
-              onChange={handleChange}
-            />
+            <label className="block text-sm font-medium text-gray-700 mb-1">Initial Liquidity (USDCx)</label>
+            <input type="number" name="initialLiquidity" required min="2"
+              className="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-purple-500 transition-all"
+              value={formData.initialLiquidity} onChange={handleChange} />
+            <p className="text-xs text-gray-500 mt-1">
+              Min 2 USDCx — Get testnet tokens at{' '}
+              <a href="https://usdcx.aleo.dev/" target="_blank" rel="noreferrer"
+                className="text-purple-600 underline">usdcx.aleo.dev</a>
+            </p>
           </div>
         </div>
 
-        {error && (
-            <div className="p-4 bg-red-50 text-red-700 rounded-lg border border-red-200">
-                {error}
-            </div>
-        )}
+        <div className="p-4 rounded-lg bg-amber-50 border border-amber-300">
+          <div className="flex items-center gap-2 mb-2">
+            <StepBadge n="1" done={approveDone} />
+            <h3 className="text-sm font-semibold text-amber-800">
+              Approve USDCx spending
+              {approveDone && <span className="ml-2 text-green-600 font-normal">— confirmed ✓</span>}
+            </h3>
+          </div>
+          <p className="text-xs text-amber-700 mb-3">
+            Authorises the contract to pull the initial liquidity from your public USDCx balance.
+            Must be confirmed on-chain before Step 2.
+          </p>
+          <button type="button" onClick={handleApprove}
+            disabled={approveLoading || approveConfirming || approveDone || !publicKey}
+            className={`w-full py-2.5 px-4 rounded-lg text-white text-sm font-semibold transition-colors ${
+              approveDone
+                ? 'bg-green-500 cursor-default'
+                : approveLoading || !publicKey
+                  ? 'bg-amber-300 cursor-not-allowed'
+                  : 'bg-amber-500 hover:bg-amber-600'
+            }`}>
+            {approveLoading    ? 'Sending…'
+             : approveConfirming ? 'Waiting for confirmation…'
+             : approveDone       ? 'Approved ✓'
+             :                    'Approve in Wallet'}
+          </button>
+          {approveTxId && (
+            <p className="text-xs text-amber-700 mt-2 break-all">
+              TX: <span className="font-mono">{approveTxId}</span>
+            </p>
+          )}
+        </div>
 
-        {status && (
-            <div className="p-4 bg-blue-50 text-blue-700 rounded-lg border border-blue-200">
-                {status}
-            </div>
-        )}
+        <div className="p-4 rounded-lg bg-purple-50 border border-purple-200">
+          <div className="flex items-center gap-2 mb-2">
+            <StepBadge n="2" done={false} />
+            <h3 className="text-sm font-semibold text-purple-800">Create Market on Aleo</h3>
+          </div>
+          <p className="text-xs text-purple-700 mb-3">
+            Uploads metadata to IPFS, submits the <code>create_market</code> transaction, then
+            reads the <code>MarketInfo</code> record from your wallet to get the correct on-chain{' '}
+            <code>market_id</code>.
+          </p>
+          <button type="submit" disabled={busy || !approveDone}
+            className={`w-full py-3 px-6 text-white font-semibold rounded-lg shadow-md transition-all ${
+              busy || !approveDone
+                ? 'bg-purple-300 cursor-not-allowed'
+                : 'bg-gradient-to-r from-purple-600 to-blue-600 hover:shadow-lg hover:-translate-y-0.5'
+            }`}>
+            {awaitingRecord ? 'Reading market_id from wallet…'
+             : createLoading ? 'Creating Market…'
+             :                 'Create Market'}
+          </button>
+          {awaitingRecord && (
+            <p className="text-xs text-purple-600 mt-2 text-center animate-pulse">
+              Waiting for MarketInfo record to appear in your wallet (up to 2 min)…
+            </p>
+          )}
+        </div>
 
-        <button
-          type="submit"
-          disabled={loading}
-          className={`w-full py-3 px-6 text-white font-semibold rounded-lg shadow-md transition-all ${
-            loading
-              ? 'bg-purple-300 cursor-not-allowed'
-              : 'bg-gradient-to-r from-purple-600 to-blue-600 hover:shadow-lg transform hover:-translate-y-0.5'
-          }`}
-        >
-          {loading ? 'Creating Market...' : 'Create Market on Aleo'}
-        </button>
+        {error  && <div className="p-4 bg-red-50   text-red-700  rounded-lg border border-red-200   text-sm">{error}</div>}
+        {status && <div className="p-4 bg-blue-50  text-blue-700 rounded-lg border border-blue-200  text-sm whitespace-pre-wrap">{status}</div>}
       </form>
+
+      {createdMarket && (
+        <div className="mt-8 p-5 rounded-xl border-2 border-green-400 bg-green-50">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <span className="text-green-600 text-xl">🎉</span>
+              <h3 className="text-base font-bold text-green-800">Step 3 — Add to Market Registry</h3>
+            </div>
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(
+                  JSON.stringify(createdMarket, null, 2)
+                );
+                setRegistryCopied(true);
+                setTimeout(() => setRegistryCopied(false), 2000);
+              }}
+              className="text-xs font-semibold py-1.5 px-3 rounded-lg bg-green-600 text-white hover:bg-green-700 transition-colors"
+            >
+              {registryCopied ? '✓ Copied!' : 'Copy JSON'}
+            </button>
+          </div>
+          <p className="text-xs text-green-700 mb-3">
+            Copy this entry and add it to{' '}
+            <code className="font-mono bg-green-100 px-1 rounded">frontend/public/markets.json</code>.
+            {createdMarket.market_id.startsWith('PENDING_') && (
+              <span className="text-amber-700 font-semibold"> Replace the PENDING_... market_id with the real value from your Shield wallet → Records → MarketInfo.</span>
+            )}
+          </p>
+          <pre className="text-xs font-mono bg-white border border-green-200 rounded-lg p-3 overflow-x-auto text-gray-700 whitespace-pre">
+            {JSON.stringify(createdMarket, null, 2)}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }

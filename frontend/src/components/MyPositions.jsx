@@ -1,397 +1,533 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useWallet } from '@provablehq/aleo-wallet-adaptor-react';
-import { fetchFromIPFS } from '../utils/ipfs';
-import { PROGRAM_ID } from "../core/constants.js";
-import { createAleoTransaction } from "../core/transaction-helper.js";
+import { PROGRAM_ID } from '../core/constants.js';
+import { requestTransaction, normalizeWalletError } from '../lib/walletAdapter.js';
+import {
+  loadPositions,
+  removePosition,
+  updatePosition,
+} from '../lib/usePositionsStore.js';
 
-function MyPositions() {
-  const { wallet, address: publicKey, requestRecords, requestTransaction } = useWallet();
-  const [positions, setPositions] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [claiming, setClaiming] = useState(null);
-  const [error, setError] = useState('');
+// ─── Explorer base ─────────────────────────────────────────────────────────────
+const EXPLORER = 'https://api.provable.com/v2/testnet';
 
-  // Fetch user's Position records
-  const handleFetchPositions = async () => {
-    if (!publicKey) {
-      setError('Please connect your wallet first');
-      return;
-    }
+// ─── Fetch a single mapping value from chain ──────────────────────────────────
+async function fetchMapping(name, key) {
+  const cleanKey = key.toString().trim().endsWith('field') ? key : `${key}field`;
+  try {
+    const r = await fetch(`${EXPLORER}/program/${PROGRAM_ID}/mapping/${name}/${cleanKey}`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) return null;
+    const v = await r.json();
+    const s = (v.value?.toString() ?? v?.toString()).replace(/"/g, '').trim();
+    if (s === 'true')  return true;
+    if (s === 'false') return false;
+    const m = s.match(/(-?\d+)/);
+    return m ? +m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Fetch market state from chain ────────────────────────────────────────────
+async function fetchMarketState(marketId) {
+  const [yesPool, noPool, vault, state, result, winPool] = await Promise.all([
+    fetchMapping('yes_pools',      marketId),
+    fetchMapping('no_pools',       marketId),
+    fetchMapping('vault_balances', marketId),
+    fetchMapping('market_states',  marketId),
+    fetchMapping('market_results', marketId),
+    fetchMapping('winning_pools',  marketId),
+  ]);
+  return {
+    yes_pool:     yesPool  ?? 0,
+    no_pool:      noPool   ?? 0,
+    vault:        vault    ?? 0,
+    state:        state    ?? 0,
+    resolved:     state === 3,
+    result:       result === true,
+    winning_pool: winPool  ?? 0,
+  };
+}
+
+// ─── AMM sell preview ─────────────────────────────────────────────────────────
+function ammSellPreview(yes, no, shares, isYes) {
+  const y = BigInt(yes), n = BigInt(no), s = BigInt(shares);
+  const k = y * n;
+  if (isYes) {
+    const newNo  = n + s;
+    const newYes = k / newNo;
+    return Number(y - newYes);
+  } else {
+    const newYes = y + s;
+    const newNo  = k / newYes;
+    return Number(n - newNo);
+  }
+}
+
+// ─── Compute claim payout ─────────────────────────────────────────────────────
+function computeClaimPayout(shares, winningPool, vault) {
+  if (!winningPool || !vault || !shares) return 0n;
+  return (BigInt(shares) * BigInt(vault)) / BigInt(winningPool);
+}
+
+// ─── State label ─────────────────────────────────────────────────────────────
+const STATE_LABEL = { 0: 'Open', 1: 'Paused', 3: 'Resolved' };
+
+// ─────────────────────────────────────────────────────────────────────────────
+export default function MyPositions() {
+  const { wallet, address: publicKey } = useWallet();
+
+  const [positions,    setPositions]    = useState([]);
+  const [enriched,     setEnriched]     = useState({});
+  const [loading,      setLoading]      = useState(false);
+  const [error,        setError]        = useState('');
+  const [actionState,  setActionState]  = useState({});
+  const [pasteBox,     setPasteBox]     = useState({});  // { [txId]: string }
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+  const setAction = (txId, patch) =>
+    setActionState(prev => ({ ...prev, [txId]: { ...(prev[txId] || {}), ...patch } }));
+
+  // ── Load positions from localStorage ─────────────────────────────────────
+  const refresh = useCallback(() => {
+    if (!publicKey) return;
+    const stored = loadPositions(publicKey);
+    setPositions(stored);
+  }, [publicKey]);
+
+  // Auto-load on connect
+  useEffect(() => { refresh(); }, [publicKey, refresh]);
+
+  // ── Enrich positions with live chain state ─────────────────────────────────
+  const handleEnrich = async () => {
+    if (!publicKey) { setError('Connect your wallet first.'); return; }
+    const stored = loadPositions(publicKey);
+    setPositions(stored);
+    if (stored.length === 0) return;
 
     setLoading(true);
     setError('');
-
     try {
-      const records = await requestRecords(PROGRAM_ID);
-      console.log('All records:', records);
-
-      // Filter for Position records (have yes_shares and no_shares fields)
-      const positionRecords = records.filter(record =>
-        record.data &&
-        (record.data.yes_shares !== undefined || record.data.no_shares !== undefined)
+      const results = await Promise.allSettled(
+        stored.map(async (p) => {
+          const chain = await fetchMarketState(p.marketId);
+          return { txId: p.txId, chain };
+        })
       );
-
-      console.log('Position records:', positionRecords);
-
-      if (positionRecords.length === 0) {
-        setPositions([]);
-        setLoading(false);
-        return;
-      }
-
-      // For each position, we need to find the corresponding market
-      // We'll need to fetch all Market records and match by market_id
-      const allRecords = await requestRecords(PROGRAM_ID);
-      const marketRecords = allRecords.filter(record =>
-        record.data && record.data.market_id && record.data.yes_pool !== undefined
-      );
-
-      console.log('Market records:', marketRecords);
-
-      // Enrich positions with market data
-      const enriched = await Promise.all(positionRecords.map(async (posRecord) => {
-        const posData = posRecord.data;
-
-        // Find matching market by market_id
-        const matchingMarket = marketRecords.find(m =>
-          m.data.market_id === posData.market_id
-        );
-
-        let marketData = {
-          question: 'Market not found in wallet',
-          category: 'Unknown',
-          state: 0,
-          result: false,
-          yes_pool: 0,
-          no_pool: 0,
-          recordPlaintext: null
-        };
-
-        if (matchingMarket) {
-          marketData.state = parseInt(matchingMarket.data.state) || 0;
-          marketData.result = matchingMarket.data.result === 'true';
-          marketData.yes_pool = parseInt(matchingMarket.data.yes_pool) || 0;
-          marketData.no_pool = parseInt(matchingMarket.data.no_pool) || 0;
-          marketData.recordPlaintext = matchingMarket.plaintext;
-
-          // Fetch metadata
-          if (matchingMarket.data.metadata_cid) {
-            try {
-              const cid = matchingMarket.data.metadata_cid.replace(/field|u64|u8|\.public|\.private/g, '').trim();
-              const metadata = await fetchFromIPFS(cid);
-              marketData.question = metadata.question || 'Unknown';
-              marketData.category = metadata.category || 'General';
-              marketData.image = metadata.image;
-            } catch (e) {
-              console.error('Failed to fetch metadata:', e);
-            }
-          }
+      const newEnriched = {};
+      for (const r of results) {
+        if (r.status === 'fulfilled') {
+          newEnriched[r.value.txId] = r.value.chain;
         }
-
-        return {
-          positionPlaintext: posRecord.plaintext,
-          positionData: posData,
-          market_id: posData.market_id,
-          yes_shares: parseInt(posData.yes_shares) || 0,
-          no_shares: parseInt(posData.no_shares) || 0,
-          timestamp: parseInt(posData.timestamp) || 0,
-          ...marketData
-        };
-      }));
-
-      setPositions(enriched);
-
-    } catch (err) {
-      console.error('Error fetching positions:', err);
-      setError(`Failed to fetch positions: ${err.message}`);
+      }
+      setEnriched(newEnriched);
+    } catch (e) {
+      setError('Failed to fetch chain state: ' + e.message);
     } finally {
       setLoading(false);
     }
   };
 
-  // Fetch on mount
-  useEffect(() => {
-    if (publicKey) {
-      handleFetchPositions();
-    }
-  }, [publicKey]);
-
-  // Claim winnings
-  const handleClaim = async (position) => {
-    if (!wallet || !publicKey) {
-      setError('Please connect your wallet');
+  // ── Sell ─────────────────────────────────────────────────────────────────
+  const handleSell = async (pos, slippageBps = 50) => {
+    const id = pos.txId;
+    if (!pos.plaintext) {
+      setAction(id, {
+        error: 'Position record plaintext not available. Open the Position record in your wallet, tap Copy Plaintext, and paste it in the "Manual sell" box.',
+      });
       return;
     }
 
-    if (!position.recordPlaintext) {
-      setError('Market record not found in wallet. You may need to sync your records.');
-      return;
-    }
-
-    setClaiming(position.market_id);
-    setError('');
-
+    setAction(id, { loading: true, status: 'Fetching pool state…', error: '' });
     try {
-      const inputs = [
-        position.recordPlaintext,      // Market record
-        position.positionPlaintext     // Position record
-      ];
+      const chain = await fetchMarketState(pos.marketId);
+      const isYes = pos.outcome === 'YES';
+      const shares = pos.shares ?? 0;
+      const rawPayout = ammSellPreview(chain.yes_pool, chain.no_pool, shares, isYes);
+      const minPayout = Math.floor(rawPayout * (10_000 - slippageBps) / 10_000);
 
-      console.log('Claiming winnings with inputs:', inputs);
+      // Fetch latest block for deadline
+      let deadline = 999_999_999;
+      try {
+        const br = await fetch(`${EXPLORER}/block/height/latest`, { signal: AbortSignal.timeout(3000) });
+        if (br.ok) { const b = await br.json(); deadline = (parseInt(b) || 0) + 20; }
+      } catch { }
 
-      const aleoTransaction = createAleoTransaction(
-        publicKey,
-        PROGRAM_ID,
-        'claim_winning',
-        inputs,
-        5000,
-        false
+      setAction(id, { status: 'Waiting for wallet approval…' });
+      const txId = await requestTransaction(
+        wallet?.adapter,
+        {
+          programId: PROGRAM_ID,
+          functionName: 'sell_shares',
+          inputs: [
+            `${pos.marketId}`,        // public market_id
+            pos.plaintext,             // private Position record — ZK hidden ✓
+            `${isYes}`,               // private outcome — ZK hidden ✓
+            `${shares}u64`,           // private share_amount — ZK hidden ✓
+            `${minPayout}u64`,        // public min_payout_out
+            `${deadline}u32`,         // public deadline
+          ],
+          fee: 2.0,
+        },
+        publicKey
       );
-
-      const txId = await requestTransaction(aleoTransaction);
-      console.log('Claim transaction submitted:', txId);
-
-      // Calculate payout
-      const payout = position.result ? position.yes_shares : position.no_shares;
-
-      alert(`Winnings claimed! Transaction: ${txId}\n\nPayout: ${(payout / 1_000_000).toFixed(2)} credits`);
-
-      // Remove claimed position from list (optimistic)
-      setPositions(prev => prev.filter(p => p.market_id !== position.market_id));
-
+      setAction(id, {
+        loading: false,
+        status: `✅ Sell submitted! TX: ${txId}\nCall Withdraw once confirmed on-chain.`,
+        pendingWithdraw: String(rawPayout),
+      });
     } catch (err) {
-      console.error('Error claiming winnings:', err);
-      setError(`Failed to claim winnings: ${err.message}`);
-    } finally {
-      setClaiming(null);
+      setAction(id, { loading: false, error: normalizeWalletError(err).message });
     }
   };
 
-  const getStateLabel = (state) => {
-    switch(state) {
-      case 0: return 'Open';
-      case 1: return 'Paused';
-      case 2: return 'Resolving';
-      case 3: return 'Resolved';
-      default: return 'Unknown';
+  // ── Claim winnings ─────────────────────────────────────────────────────────
+  const handleClaim = async (pos) => {
+    const id = pos.txId;
+    setAction(id, { loading: true, status: 'Computing payout…', error: '' });
+    try {
+      const chain = await fetchMarketState(pos.marketId);
+      const isYes = pos.outcome === 'YES';
+      const userShares = chain.result ? (isYes ? pos.shares : 0) : (!isYes ? pos.shares : 0);
+      if (!userShares) {
+        setAction(id, { loading: false, error: 'You hold the losing side — no winnings to claim.' });
+        return;
+      }
+      const payout = computeClaimPayout(userShares, chain.winning_pool, chain.vault);
+      if (!payout) {
+        setAction(id, { loading: false, error: 'Payout is 0 — market may be empty.' });
+        return;
+      }
+
+      setAction(id, { status: 'Waiting for wallet approval…' });
+      const txId = await requestTransaction(
+        wallet?.adapter,
+        {
+          programId: PROGRAM_ID,
+          functionName: 'claim_winnings',
+          inputs: [
+            pos.plaintext,
+            `${pos.marketId}`,
+            `${payout}u128`,
+          ],
+          fee: 2.0,
+        },
+        publicKey
+      );
+      setAction(id, {
+        loading: false,
+        status: `✅ Claim submitted! TX: ${txId}\nNow call Withdraw to receive your USDCx.`,
+        pendingWithdraw: payout.toString(),
+      });
+    } catch (err) {
+      setAction(id, { loading: false, error: normalizeWalletError(err).message });
     }
   };
 
-  const calculatePayout = (position) => {
-    if (position.state !== 3) {
-      // Market not resolved yet
-      return {
-        status: 'pending',
-        amount: 0,
-        isWinner: null
-      };
+  // ── Withdraw ───────────────────────────────────────────────────────────────
+  const handleWithdraw = async (pos, amount) => {
+    const id = pos.txId;
+    setAction(id, { loading: true, status: 'Submitting withdraw…', error: '' });
+    try {
+      const txId = await requestTransaction(
+        wallet?.adapter,
+        {
+          programId: PROGRAM_ID,
+          functionName: 'withdraw',
+          inputs: [`${pos.marketId}`, `${amount}u128`],
+          fee: 1.0,
+        },
+        publicKey
+      );
+      setAction(id, {
+        loading: false,
+        status: `✅ Withdrawn! TX: ${txId}. USDCx is now in your public balance.`,
+        pendingWithdraw: null,
+      });
+      // Mark claimed in localStorage
+      updatePosition(publicKey, id, { claimed: true, status: 'settled' });
+      refresh();
+    } catch (err) {
+      setAction(id, { loading: false, error: normalizeWalletError(err).message });
     }
-
-    const isWinner = position.result
-      ? position.yes_shares > 0
-      : position.no_shares > 0;
-
-    const payout = position.result
-      ? position.yes_shares
-      : position.no_shares;
-
-    return {
-      status: 'resolved',
-      amount: payout,
-      isWinner
-    };
   };
 
-  const calculateOdds = (yes_pool, no_pool) => {
-    const total = yes_pool + no_pool;
-    if (total === 0) return 50;
-    return Math.round((yes_pool / total) * 100);
+  // ── Remove a position ──────────────────────────────────────────────────────
+  const handleRemove = (txId) => {
+    removePosition(publicKey, txId);
+    refresh();
   };
 
+  // ─────────────────────────────────────────────────────────────────────────────
   return (
-    <div className="max-w-4xl mx-auto">
+    <div className="max-w-4xl mx-auto px-4 py-8">
+
+      {/* Page title */}
       <div className="mb-8">
-        <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-2">My Positions</h2>
-        <p className="text-gray-600 dark:text-gray-400">View your positions and claim winnings from resolved markets</p>
+        <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-1">My Positions</h2>
+        <p className="text-gray-500 dark:text-gray-400 text-sm">
+          Positions are stored locally and enriched with live on-chain data.
+        </p>
       </div>
 
-      {/* Wallet Connection */}
+      {/* Wallet guard */}
       {!publicKey ? (
-        <div className="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg p-4 mb-6">
-          <p className="text-yellow-800 dark:text-yellow-200">Please connect your wallet to view your positions</p>
+        <div className="rounded-xl border border-yellow-300 dark:border-yellow-700 bg-yellow-50 dark:bg-yellow-900/20 p-5 mb-6 text-yellow-800 dark:text-yellow-200">
+          Connect your wallet to view positions.
         </div>
       ) : (
-        <button
-          onClick={handleFetchPositions}
-          disabled={loading}
-          className="mb-6 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 transition-colors"
-        >
-          {loading ? 'Fetching...' : 'Refresh Positions'}
-        </button>
+        <div className="flex gap-3 mb-6">
+          <button
+            onClick={handleEnrich}
+            disabled={loading}
+            className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold disabled:opacity-50 transition-colors"
+          >
+            {loading ? 'Refreshing…' : '🔄 Refresh Positions'}
+          </button>
+        </div>
       )}
 
-      {/* Error Message */}
+      {/* Error */}
       {error && (
-        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4 mb-6">
-          <p className="text-red-800 dark:text-red-200">{error}</p>
+        <div className="mb-6 p-4 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-300 dark:border-red-700 text-red-800 dark:text-red-200 text-sm">
+          {error}
         </div>
       )}
 
-      {/* Empty State */}
+      {/* Privacy note */}
+      {positions.length > 0 && (
+        <div className="mb-6 p-3 rounded-lg bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 text-purple-700 dark:text-purple-300 text-xs">
+          🔒 <strong>Privacy Protected</strong> — Your bets are ZK-encrypted on-chain. Only you can see your positions here.
+        </div>
+      )}
+
+      {/* Empty state */}
       {positions.length === 0 && !loading && publicKey && (
-        <div className="text-center py-12 bg-gray-50 dark:bg-slate-800 rounded-lg border border-gray-200 dark:border-slate-700">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-gray-200 dark:bg-slate-700 mb-4">
-            <svg className="w-8 h-8 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
-            </svg>
-          </div>
-          <h3 className="text-lg font-semibold text-gray-600 dark:text-gray-300 mb-2">No positions found</h3>
-          <p className="text-gray-500 dark:text-gray-400">Place a bet on a market to create your first position</p>
+        <div className="text-center py-16 rounded-xl bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700">
+          <p className="text-2xl mb-2">🎯</p>
+          <h3 className="text-lg font-semibold text-gray-700 dark:text-gray-300 mb-1">No positions yet</h3>
+          <p className="text-gray-500 dark:text-gray-400 text-sm">
+            Place a bet on any market — your positions appear here instantly.
+          </p>
         </div>
       )}
 
-      {/* Positions List */}
-      <div className="space-y-4">
-        {positions.map((position) => {
-          const payout = calculatePayout(position);
-          const yesOdds = calculateOdds(position.yes_pool, position.no_pool);
-          const hasYesShares = position.yes_shares > 0;
-          const hasNoShares = position.no_shares > 0;
+      {/* Position cards */}
+      <div className="space-y-5">
+        {positions.map((pos) => {
+          const id    = pos.txId;
+          const act   = actionState[id] || {};
+          const chain = enriched[id];
+          const isYes = pos.outcome === 'YES';
+
+          // Chain-enriched values (fallback to 0 if not yet fetched)
+          const yesPool    = chain?.yes_pool     ?? 0;
+          const noPool     = chain?.no_pool      ?? 0;
+          const vault      = chain?.vault        ?? 0;
+          const state      = chain?.state        ?? null;
+          const resolved   = chain?.resolved     ?? false;
+          const result     = chain?.result       ?? false;
+          const winPool    = chain?.winning_pool ?? 0;
+
+          const totalPool  = yesPool + noPool;
+          const yesOdds    = totalPool > 0 ? Math.round((yesPool / totalPool) * 100) : 50;
+
+          // Sell preview
+          const shares     = pos.shares ?? 0;
+          const sellPayout = (state === 0 || state === null) && shares > 0 && totalPool > 0
+            ? ammSellPreview(yesPool, noPool, shares, isYes) : 0;
+
+          // Claim
+          const userWon    = resolved && (result === isYes);
+          const claimAmt   = userWon && shares > 0
+            ? computeClaimPayout(shares, winPool, vault) : null;
 
           return (
-            <div
-              key={position.market_id}
-              className="bg-white dark:bg-slate-800 rounded-lg border border-gray-200 dark:border-slate-700 p-6"
+            <div key={id}
+              className="bg-white dark:bg-slate-800 rounded-xl border border-gray-200 dark:border-slate-700 p-5"
             >
-              {/* Header */}
-              <div className="flex items-start justify-between mb-4">
-                <div className="flex-1">
-                  <div className="flex items-center space-x-2 mb-2">
-                    <span className={`text-xs px-2 py-1 rounded-full font-medium ${
-                      position.category === 'Politics' ? 'bg-blue-100 text-blue-800' :
-                      position.category === 'Crypto' ? 'bg-orange-100 text-orange-800' :
-                      position.category === 'Sports' ? 'bg-green-100 text-green-800' :
-                      'bg-gray-100 text-gray-800'
-                    }`}>
-                      {position.category}
+              {/* Header row */}
+              <div className="flex items-start justify-between gap-3 mb-4">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                    isYes
+                      ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300'
+                      : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
+                  }`}>{pos.outcome}</span>
+                  {state !== null && (
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 dark:bg-slate-700 text-gray-600 dark:text-gray-300">
+                      {STATE_LABEL[state] ?? 'Unknown'}
                     </span>
-                    <span className={`text-xs px-2 py-1 rounded-full font-medium ${
-                      position.state === 3
-                        ? 'bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-200'
-                        : 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-                    }`}>
-                      {getStateLabel(position.state)}
+                  )}
+                  {pos.status === 'pending' && (
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 animate-pulse">
+                      ⏳ Pending
                     </span>
-                  </div>
-                  <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">
-                    {position.question}
-                  </h3>
-                </div>
-              </div>
-
-              {/* Position Details */}
-              <div className="grid grid-cols-2 gap-4 mb-4 p-4 bg-gray-50 dark:bg-slate-700/50 rounded-lg">
-                <div>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">Your Position</p>
-                  <div className="flex items-center space-x-2 mt-1">
-                    {hasYesShares && (
-                      <span className="px-2 py-1 bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200 rounded font-semibold text-sm">
-                        YES: {(position.yes_shares / 1_000_000).toFixed(2)} shares
-                      </span>
-                    )}
-                    {hasNoShares && (
-                      <span className="px-2 py-1 bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200 rounded font-semibold text-sm">
-                        NO: {(position.no_shares / 1_000_000).toFixed(2)} shares
-                      </span>
-                    )}
-                  </div>
-                </div>
-                <div>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">Current Odds</p>
-                  <p className="text-lg font-semibold text-gray-900 dark:text-white mt-1">
-                    {yesOdds}% YES / {100 - yesOdds}% NO
-                  </p>
-                </div>
-              </div>
-
-              {/* Payout Info */}
-              {payout.status === 'resolved' && (
-                <div className={`mb-4 p-4 rounded-lg border ${
-                  payout.isWinner
-                    ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800'
-                    : 'bg-gray-50 dark:bg-gray-900/20 border-gray-200 dark:border-gray-700'
-                }`}>
-                  {payout.isWinner ? (
-                    <>
-                      <p className="text-green-800 dark:text-green-200 font-semibold mb-1">
-                        🎉 You Won!
-                      </p>
-                      <p className="text-green-700 dark:text-green-300">
-                        Payout: <span className="font-bold">{(payout.amount / 1_000_000).toFixed(2)} credits</span>
-                      </p>
-                      <p className="text-sm text-green-600 dark:text-green-400 mt-1">
-                        Market resolved: {position.result ? 'YES' : 'NO'} won
-                      </p>
-                    </>
-                  ) : (
-                    <>
-                      <p className="text-gray-700 dark:text-gray-300 font-semibold mb-1">
-                        Market Resolved
-                      </p>
-                      <p className="text-gray-600 dark:text-gray-400">
-                        Your position did not win. Payout: 0 credits
-                      </p>
-                      <p className="text-sm text-gray-500 dark:text-gray-500 mt-1">
-                        Market resolved: {position.result ? 'YES' : 'NO'} won
-                      </p>
-                    </>
                   )}
                 </div>
-              )}
 
-              {payout.status === 'pending' && (
-                <div className="mb-4 p-4 rounded-lg bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800">
-                  <p className="text-blue-800 dark:text-blue-200">
-                    ⏳ Market still open - waiting for resolution
-                  </p>
-                </div>
-              )}
-
-              {/* Claim Button */}
-              {payout.status === 'resolved' && payout.isWinner && payout.amount > 0 && (
+                {/* Remove btn */}
                 <button
-                  onClick={() => handleClaim(position)}
-                  disabled={claiming === position.market_id}
-                  className="w-full py-3 px-4 bg-gradient-to-r from-green-600 to-green-700 hover:from-green-700 hover:to-green-800 text-white font-semibold rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-md hover:shadow-lg"
-                >
-                  {claiming === position.market_id ? (
-                    <span className="flex items-center justify-center">
-                      <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                      </svg>
-                      Claiming...
-                    </span>
-                  ) : (
-                    `Claim ${(payout.amount / 1_000_000).toFixed(2)} Credits`
-                  )}
-                </button>
+                  onClick={() => handleRemove(id)}
+                  className="text-xs text-gray-400 hover:text-red-500 transition-colors"
+                  title="Remove from list"
+                >✕</button>
+              </div>
+
+              {/* Question */}
+              <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-4">
+                {pos.marketQuestion}
+              </h3>
+
+              {/* Stats grid */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4 text-sm">
+                <div className="bg-gray-50 dark:bg-slate-700/50 rounded-lg p-3">
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Spent</p>
+                  <p className="font-semibold text-gray-900 dark:text-white">
+                    {pos.amountMicro ? (pos.amountMicro / 1e6).toFixed(2) : '—'} USDCx
+                  </p>
+                </div>
+                <div className="bg-gray-50 dark:bg-slate-700/50 rounded-lg p-3">
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Shares</p>
+                  <p className="font-semibold text-gray-900 dark:text-white">
+                    {shares ? (shares / 1e6).toFixed(6) : '—'}
+                  </p>
+                </div>
+                <div className="bg-gray-50 dark:bg-slate-700/50 rounded-lg p-3">
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">YES odds</p>
+                  <p className="font-semibold text-gray-900 dark:text-white">
+                    {chain ? `${yesOdds}%` : '—'}
+                  </p>
+                </div>
+                <div className="bg-gray-50 dark:bg-slate-700/50 rounded-lg p-3">
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">TX</p>
+                  <a
+                    href={`https://testnet.explorer.provable.com/transaction/${id}`}
+                    target="_blank" rel="noreferrer"
+                    className="text-blue-500 hover:underline font-mono text-xs truncate block"
+                  >
+                    {id.startsWith('at1') ? id.slice(0, 14) + '…' : id.slice(0, 13) + '…'}
+                  </a>
+                </div>
+              </div>
+
+              {/* Sell preview */}
+              {sellPayout > 0 && (
+                <div className="mb-3 p-3 rounded-lg bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 text-sm">
+                  <span className="text-gray-500 dark:text-gray-400">Sell all → </span>
+                  <span className="font-semibold text-green-600 dark:text-green-400">
+                    ~{(sellPayout / 1e6).toFixed(6)} USDCx
+                  </span>
+                  <span className="text-xs text-gray-400 ml-2">(0.5% slippage)</span>
+                </div>
+              )}
+
+              {/* Resolution */}
+              {resolved && (
+                <div className={`mb-3 p-3 rounded-lg border text-sm font-medium ${
+                  userWon
+                    ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-800 dark:text-green-200'
+                    : 'bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400'
+                }`}>
+                  {userWon
+                    ? `🎉 You Won! Resolved ${result ? 'YES' : 'NO'}${claimAmt ? ` · ~${(Number(claimAmt) / 1e6).toFixed(4)} USDCx` : ''}`
+                    : `Market resolved ${result ? 'YES' : 'NO'} — your ${pos.outcome} position did not win`
+                  }
+                </div>
+              )}
+
+              {/* Action buttons */}
+              <div className="flex flex-wrap gap-2 mt-2">
+                {/* SELL — market open */}
+                {(state === 0 || state === null) && shares > 0 && pos.plaintext && (
+                  <button
+                    onClick={() => handleSell(pos)}
+                    disabled={act.loading}
+                    className="px-4 py-2 text-sm font-semibold rounded-lg bg-orange-600 hover:bg-orange-500 text-white disabled:opacity-50 transition-colors"
+                  >
+                    {act.loading && act.status?.includes('Sell') ? 'Submitting…' : `Sell ${pos.outcome}`}
+                  </button>
+                )}
+
+                {/* CLAIM — resolved + winner */}
+                {resolved && userWon && !act.pendingWithdraw && !pos.claimed && pos.plaintext && (
+                  <button
+                    onClick={() => handleClaim(pos)}
+                    disabled={act.loading}
+                    className="px-4 py-2 text-sm font-semibold rounded-lg bg-green-600 hover:bg-green-500 text-white disabled:opacity-50 transition-colors"
+                  >
+                    {act.loading ? 'Claiming…' : '🏆 Claim Winnings'}
+                  </button>
+                )}
+
+                {/* WITHDRAW — after sell or claim */}
+                {act.pendingWithdraw && (
+                  <button
+                    onClick={() => handleWithdraw(pos, act.pendingWithdraw)}
+                    disabled={act.loading}
+                    className="px-4 py-2 text-sm font-semibold rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white disabled:opacity-50 transition-colors"
+                  >
+                    {act.loading ? 'Withdrawing…' : `Withdraw ${(Number(act.pendingWithdraw) / 1e6).toFixed(4)} USDCx`}
+                  </button>
+                )}
+              </div>
+
+              {/* Missing plaintext — inline paste box */}
+              {!pos.plaintext && shares > 0 && (
+                <div className="mt-3 text-xs">
+                  <p className="text-amber-600 dark:text-amber-400 mb-2">
+                    ℹ️ To sell, open your wallet → Records → find the <strong>Position</strong> record → Copy Plaintext, then paste it here:
+                  </p>
+                  <textarea
+                    rows={3}
+                    className="w-full p-2 rounded bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 font-mono text-xs text-slate-800 dark:text-slate-200"
+                    placeholder="{ owner: ..., market_id: ..., yes_shares: ..., ... }"
+                    value={pasteBox[id] || ''}
+                    onChange={e => setPasteBox(prev => ({ ...prev, [id]: e.target.value }))}
+                  />
+                  <button
+                    disabled={!pasteBox[id]?.trim()}
+                    onClick={() => {
+                      updatePosition(publicKey, id, { plaintext: pasteBox[id].trim() });
+                      setPasteBox(prev => ({ ...prev, [id]: '' }));
+                      refresh();
+                    }}
+                    className="mt-1 px-3 py-1 rounded bg-blue-600 text-white text-xs disabled:opacity-50"
+                  >
+                    Save Record
+                  </button>
+                </div>
+              )}
+
+              {/* Action feedback */}
+              {act.status && (
+                <div className="mt-3 p-3 rounded-lg bg-green-900/20 border border-green-700/50 text-green-300 text-xs break-all whitespace-pre-wrap">
+                  {act.status}
+                </div>
+              )}
+              {act.error && (
+                <div className="mt-3 p-3 rounded-lg bg-red-900/20 border border-red-700/50 text-red-300 text-xs">
+                  {act.error}
+                </div>
               )}
             </div>
           );
         })}
       </div>
 
-      {/* Privacy Reminder */}
+      {/* Help box */}
       {positions.length > 0 && (
-        <div className="mt-8 p-4 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 rounded-lg">
-          <p className="text-sm text-purple-800 dark:text-purple-200">
-            🔒 <span className="font-semibold">Privacy Protected:</span> Only you can see your positions. Your bets are encrypted on-chain.
-          </p>
+        <div className="mt-8 p-4 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm text-slate-600 dark:text-slate-400">
+          <strong className="text-slate-800 dark:text-slate-200">💡 How it works</strong>
+          <ul className="mt-2 space-y-1 list-disc list-inside">
+            <li>Positions are saved locally the moment you place a bet.</li>
+            <li>Click <strong>Refresh Positions</strong> to pull live pool state and resolution status from the chain.</li>
+            <li>To sell or claim, your wallet must have the Position record plaintext. If "Sell" is greyed out, paste your record plaintext from your wallet.</li>
+          </ul>
         </div>
       )}
     </div>
   );
 }
-
-export default MyPositions;

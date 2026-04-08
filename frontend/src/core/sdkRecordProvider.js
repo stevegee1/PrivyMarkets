@@ -23,7 +23,7 @@ export async function fetchRecordsViaSDK(viewKey, programId = "credits.aleo") {
       console.log("Initializing SDK thread pool...");
       await initThreadPool();
       threadPoolInitialized = true;
-      console.log("✅ Thread pool initialized");
+      console.log(" Thread pool initialized");
     }
 
     // Create account from view key
@@ -32,7 +32,7 @@ export async function fetchRecordsViaSDK(viewKey, programId = "credits.aleo") {
 
     // Setup network client pointing to Aleo explorer API
     const networkClient = new AleoNetworkClient(
-      "https://api.explorer.provable.com/v1",
+      "https://api.provable.com/v2/testnet",
     );
 
     // Create record provider that fetches and decrypts records from network
